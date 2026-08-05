@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a Cloudflare Worker exposing `POST /api/chat` that proxies a website's chat messages to Notion's internal `runInferenceTranscript` v3 API (auth via `token_v2`), streams tokens back over SSE like Notion's own chat, remembers multi-turn context by full-replaying the transcript, and auto-rotates to a freshly-created workspace when the current one runs out of AI credit.
+**Goal:** Ship a Cloudflare Worker exposing `POST /api/chat` that proxies a website's chat messages to Notion's internal `runInferenceTranscript` v3 API (auth via `token_v2`), streams tokens back over SSE like Notion's own chat, remembers multi-turn context by full-replaying the transcript the website sends each turn (the Worker is **stateless for the transcript** — it stores no chat history; the website owns `conversationId` + the message history and re-sends it every turn), and auto-rotates to a freshly-created workspace when the current one runs out of AI credit.
 
-**Architecture:** A single Worker (`src/worker.js`) owns request auth, transcript persistence (KV), and SSE streaming. Pure helpers are split out: `patch.js` applies Notion's NDJSON JSON-Patch stream (handling both `patch-start` and `patch-sync` snapshots), `sse.js` turns patch ops into SSE `thinking`/`token` deltas, `transcript.js` builds Notion request bodies (config/context/entries, createSpace, space discovery), `notion.js` does the HTTP calls + line streaming, `store.js` does KV, and `rotate.js` orchestrates workspace rotation (createSpace → getSpaces → switch). Multi-turn memory is achieved by replaying the full transcript each turn (the Notion "pointer" continuation mechanism does not work for API-created threads — confirmed).
+**Architecture:** A single Worker (`src/worker.js`) owns request auth and SSE streaming. It is **stateless for the transcript** — the website sends the full message history each turn, and the Worker stores no chat history (only `state:activeSpace` in KV at 1 read/turn; no per-turn transcript read/write, which addresses the user's KV rate-limit concern). Pure helpers are split out: `patch.js` applies Notion's NDJSON JSON-Patch stream (handling both `patch-start` and `patch-sync` snapshots), `sse.js` turns patch ops into SSE `thinking`/`token` deltas, `transcript.js` builds Notion request bodies (config/context/entries, createSpace, space discovery), `notion.js` does the HTTP calls + line streaming, `store.js` does KV (active-space only), and `rotate.js` orchestrates workspace rotation (createSpace → getSpaces → switch). Multi-turn memory is achieved by replaying the full transcript each turn (the Notion "pointer" continuation mechanism does not work for API-created threads — confirmed twice; and there is no fetch-thread API — `getThread`/`getThreads`/`syncRecordValues` all fail/empty — confirmed).
 
 **Tech Stack:** Cloudflare Workers (pure Web APIs — `crypto.getRandomValues`, `TextDecoder`, `TransformStream`, `ReadableStream`; no `nodejs_compat` needed), Wrangler 3, Vitest 2 with `@cloudflare/vitest-pool-workers` (tests run in the Workers runtime via miniflare).
 
@@ -35,9 +35,9 @@ src/
   sse.js          # sse() encoder + PatchStream (patch op -> thinking/token delta)
   transcript.js   # nid(), DEFAULT_CONFIG, build* body builders, findNewSpace/findSpaceById
   notion.js       # notionHeaders, callRunInference, ndjsonLines, getSpaces, createSpace
-  store.js        # KV transcript + activeSpace (loadTranscript/appendTurn/getActiveSpace/...)
+  store.js        # KV active-space store only (getActiveSpace/setActiveSpace) — NO transcript storage
   rotate.js       # rotateWorkspace(): createSpace -> poll getSpaces -> findNewSpace -> setActiveSpace
-  worker.js       # entry: auth, routing, streamChat (SSE), runTurn (load->build->stream->rotate->save)
+  worker.js       # entry: auth, routing, streamChat (SSE), runTurn (build from client messages -> stream -> rotate)
 test/
   patch.test.mjs
   sse.test.mjs
@@ -50,9 +50,10 @@ test/
     runInference-hello.ndjson        # (exists)
     runInference-unavailable.ndjson  # (exists)
     getSpaces.json                   # (exists)
-wrangler.toml      # Worker config + KV binding + public [vars] (dev/deploy only; tests use miniflare options)
+wrangler.toml       # Worker config + KV binding + public [vars] (dev/deploy only)
+wrangler.test.toml  # Test-only worker config: KV binding + all test vars (read by vitest config)
 package.json
-vitest.config.mjs  # cloudflareTest() with miniflare kvNamespaces + vars (NOT wrangler-driven)
+vitest.config.mjs   # cloudflareTest({ wrangler: { configPath: "./wrangler.test.toml" } })
 .dev.vars.example
 .gitignore
 README.md
@@ -65,11 +66,11 @@ Responsibilities are one-per-file so each test suite targets one module. `worker
 ## Task 1: Project scaffold + Worker skeleton + toolchain smoke test
 
 **Files:**
-- Create: `package.json`, `wrangler.toml`, `vitest.config.mjs`, `.gitignore`, `.dev.vars.example`, `src/worker.js`, `test/worker.test.mjs`
+- Create: `package.json`, `wrangler.toml`, `wrangler.test.toml`, `vitest.config.mjs`, `.gitignore`, `.dev.vars.example`, `src/worker.js`, `test/worker.test.mjs`
 
 **Interfaces:**
 - Consumes: none.
-- Produces: a running Vitest-in-Workers toolchain; `src/worker.js` default-exports `{ fetch(req, env, ctx) }` with a `GET /health` route returning `200 "ok"` and `404` otherwise (Task 8 adds `/api/chat`). `env.STORE` (KV) and `env.API_KEY` + config vars are supplied by `vitest.config.mjs`'s miniflare options.
+- Produces: a running Vitest-in-Workers toolchain; `src/worker.js` default-exports `{ fetch(req, env, ctx) }` with a `GET /health` route returning `200 "ok"` and `404` otherwise (Task 8 adds `/api/chat`). The test `env` (`STORE` KV + `API_KEY`/`NOTION_*` vars) comes from `wrangler.test.toml`, which `vitest.config.mjs` points `cloudflareTest({ wrangler: { configPath } })` at. NOTE: vars must come from a wrangler config — `cloudflareTest({ miniflare: { vars } })` does NOT populate `env` in this pool version (verified).
 
 - [ ] **Step 1: Write `package.json`**
 
@@ -87,14 +88,14 @@ Responsibilities are one-per-file so each test suite targets one module. `worker
     "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.8.27",
-    "vitest": "^2.1.8",
-    "wrangler": "^3.90.0"
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.119.0"
   }
 }
 ```
 
-- [ ] **Step 2: Write `wrangler.toml`** (dev/deploy config; tests do NOT read this — they use `vitest.config.mjs` miniflare options)
+- [ ] **Step 2: Write `wrangler.toml`** (dev/deploy config only; tests use `wrangler.test.toml` instead)
 
 ```toml
 name = "notion-chat-proxy"
@@ -117,7 +118,7 @@ REASONING_EFFORT = "max"
 NOTION_TIMEZONE = "Asia/Saigon"
 ```
 
-- [ ] **Step 3: Write `vitest.config.mjs`** (tests are miniflare-driven, not wrangler-driven, to avoid depending on the placeholder KV id)
+- [ ] **Step 3: Write `vitest.config.mjs` and `wrangler.test.toml`** (test env: KV + all vars via a dedicated wrangler config — vars MUST come from a wrangler config, not `miniflare.vars`, which does not populate `env` in this pool version)
 
 ```js
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
@@ -126,23 +127,33 @@ import { defineProject } from "vitest/config";
 export default defineProject({
   plugins: [
     cloudflareTest({
-      miniflare: {
-        kvNamespaces: ["STORE"],
-        vars: {
-          API_KEY: "k",
-          NOTION_TOKEN_V2: "test-token",
-          NOTION_CLIENT_VERSION: "23.13.20260805.0803",
-          NOTION_MODEL: "fireworks-kimi-k3",
-          REASONING_EFFORT: "max",
-          NOTION_USER_NAME: "Ky",
-          NOTION_USER_EMAIL: "ky@example.com",
-          NOTION_TIMEZONE: "Asia/Saigon",
-        },
-      },
+      wrangler: { configPath: "./wrangler.test.toml" },
     }),
   ],
   test: { include: ["test/**/*.test.mjs"] },
 });
+```
+
+```toml
+# wrangler.test.toml — test-only worker config. Fake values (NOT real secrets);
+# safe to commit. Read by vitest.config.mjs to populate the test env.
+name = "notion-chat-proxy-test"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "test-store-id"
+
+[vars]
+API_KEY = "k"
+NOTION_TOKEN_V2 = "test-token"
+NOTION_CLIENT_VERSION = "23.13.20260805.0803"
+NOTION_MODEL = "fireworks-kimi-k3"
+REASONING_EFFORT = "max"
+NOTION_USER_NAME = "Ky"
+NOTION_USER_EMAIL = "ky@example.com"
+NOTION_TIMEZONE = "Asia/Saigon"
 ```
 
 - [ ] **Step 4: Write `.gitignore`**
@@ -153,6 +164,7 @@ node_modules/
 .dev.vars
 dist/
 _research/
+.superpowers/
 ```
 
 - [ ] **Step 5: Write `.dev.vars.example`**
@@ -187,6 +199,7 @@ export default {
 
 ```js
 import { describe, it, expect } from "vitest";
+import { env } from "cloudflare:workers";
 import worker from "../src/worker.js";
 
 function request(path, init = {}) {
@@ -203,19 +216,25 @@ describe("worker skeleton", () => {
     const res = await worker.fetch(request("/nope"), {}, { waitUntil() {} });
     expect(res.status).toBe(404);
   });
+  it("test env bindings (STORE KV + vars from wrangler.test.toml) are populated", () => {
+    expect(env.STORE).toBeTruthy();
+    expect(typeof env.STORE.put).toBe("function");
+    expect(env.API_KEY).toBe("k");
+    expect(env.NOTION_MODEL).toBe("fireworks-kimi-k3");
+  });
 });
 ```
 
 - [ ] **Step 8: Install deps and run the test to verify it PASSES (scaffold OK)**
 
 Run: `npm install && npm test`
-Expected: 2 passed. (If `npm install` fails on a version, bump the caret ranges in `package.json` to the latest installed and re-run.)
+Expected: 3 passed. (If `npm install` fails on a version, bump the caret ranges in `package.json` to the latest installed and re-run. The `cloudflareTest` plugin requires `@cloudflare/vitest-pool-workers@^0.20` + `vitest@^4`; the older `^0.8`/`^2` ranges do NOT work.)
 
 - [ ] **Step 9: Commit**
 
 ```bash
 git init 2>/dev/null || true
-git add package.json package-lock.json wrangler.toml vitest.config.mjs .gitignore .dev.vars.example src/worker.js test/worker.test.mjs test/fixtures/
+git add package.json package-lock.json wrangler.toml wrangler.test.toml vitest.config.mjs .gitignore .dev.vars.example src/worker.js test/worker.test.mjs test/fixtures/
 git commit -m "chore: scaffold worker + vitest-pool-workers toolchain"
 ```
 
@@ -1106,7 +1125,7 @@ git commit -m "feat(notion): HTTP client + NDJSON line streamer"
 
 ---
 
-## Task 6: `src/store.js` — KV transcript + active-space store
+## Task 6: `src/store.js` — KV active-space store (stateless transcript)
 
 **Files:**
 - Create: `src/store.js`, `test/store.test.mjs`
@@ -1114,44 +1133,18 @@ git commit -m "feat(notion): HTTP client + NDJSON line streamer"
 **Interfaces:**
 - Consumes: a Workers KV namespace (`kv`) — the real miniflare `STORE` binding in tests.
 - Produces (used by `worker.js`, `rotate.js`):
-  - `loadTranscript(kv, conversationId) -> { version, messages }` (empty if absent/corrupt).
-  - `saveTranscript(kv, conversationId, transcript)`.
-  - `appendTurn(kv, conversationId, { role, text }) -> transcript` (loads, pushes, saves, returns).
-  - `getActiveSpace(kv) -> record | null`.
+  - `getActiveSpace(kv) -> { spaceId, spaceViewId, name, userId } | null`.
   - `setActiveSpace(kv, record)`.
+- NOTE: the Worker is **stateless for the transcript** — the website sends `messages` each turn, so there is NO `conv:<id>` transcript key and NO per-turn transcript read/write. This module stores ONLY the active space (addresses the user's KV rate-limit concern).
 
 - [ ] **Step 1: Write the failing test `test/store.test.mjs`**
 
 ```js
 import { describe, it, expect, beforeEach } from "vitest";
 import { env } from "cloudflare:workers";
-import {
-  loadTranscript, saveTranscript, appendTurn, getActiveSpace, setActiveSpace,
-} from "../src/store.js";
+import { getActiveSpace, setActiveSpace } from "../src/store.js";
 
-beforeEach(async () => {
-  await env.STORE.delete("conv:c1");
-  await env.STORE.delete("state:activeSpace");
-});
-
-describe("transcript store", () => {
-  it("returns an empty transcript when absent", async () => {
-    expect(await loadTranscript(env.STORE, "missing")).toEqual({ version: 1, messages: [] });
-  });
-  it("appends and persists turns in order", async () => {
-    await appendTurn(env.STORE, "c1", { role: "user", text: "hi" });
-    await appendTurn(env.STORE, "c1", { role: "ai", text: "hello" });
-    const t = await loadTranscript(env.STORE, "c1");
-    expect(t.messages).toEqual([
-      { role: "user", text: "hi" },
-      { role: "ai", text: "hello" },
-    ]);
-  });
-  it("survives corrupt stored json", async () => {
-    await env.STORE.put("conv:bad", "{not json");
-    expect(await loadTranscript(env.STORE, "bad")).toEqual({ version: 1, messages: [] });
-  });
-});
+beforeEach(async () => { await env.STORE.delete("state:activeSpace"); });
 
 describe("active space store", () => {
   it("round-trips a record", async () => {
@@ -1159,6 +1152,10 @@ describe("active space store", () => {
     expect(await getActiveSpace(env.STORE)).toEqual({ spaceId: "S", spaceViewId: "SV", userId: "U", name: "N" });
   });
   it("returns null when absent", async () => {
+    expect(await getActiveSpace(env.STORE)).toBeNull();
+  });
+  it("survives corrupt stored json (returns null)", async () => {
+    await env.STORE.put("state:activeSpace", "{not json");
     expect(await getActiveSpace(env.STORE)).toBeNull();
   });
 });
@@ -1172,28 +1169,13 @@ Expected: FAIL — `Cannot find module '../src/store.js'`.
 - [ ] **Step 3: Write `src/store.js`**
 
 ```js
-// KV-backed transcript + active-space store. Pure KV access (no fetch).
+// KV-backed active-space store. Pure KV access (no fetch).
+//
+// NOTE: the Worker is stateless for the transcript — the website sends the full
+// `messages` history each turn. This module stores ONLY the active space, so there
+// is no per-turn transcript read/write (addresses the user's KV rate-limit concern).
 
-const KEY = (id) => `conv:${id}`;
 const ACTIVE = "state:activeSpace";
-
-export async function loadTranscript(kv, conversationId) {
-  const raw = await kv.get(KEY(conversationId));
-  if (!raw) return { version: 1, messages: [] };
-  try { return JSON.parse(raw); } catch { return { version: 1, messages: [] }; }
-}
-
-export async function saveTranscript(kv, conversationId, transcript) {
-  await kv.put(KEY(conversationId), JSON.stringify(transcript));
-}
-
-// Append a turn {role, text}; returns the updated transcript.
-export async function appendTurn(kv, conversationId, turn) {
-  const t = await loadTranscript(kv, conversationId);
-  t.messages.push({ role: turn.role, text: turn.text });
-  await saveTranscript(kv, conversationId, t);
-  return t;
-}
 
 export async function getActiveSpace(kv) {
   const raw = await kv.get(ACTIVE);
@@ -1209,13 +1191,13 @@ export async function setActiveSpace(kv, record) {
 - [ ] **Step 4: Run the test to verify it PASSES**
 
 Run: `npm test -- test/store.test.mjs`
-Expected: 5 passed.
+Expected: 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/store.js test/store.test.mjs
-git commit -m "feat(store): KV transcript + active-space store"
+git commit -m "feat(store): KV active-space store (stateless transcript)"
 ```
 
 ---
@@ -1351,8 +1333,8 @@ git commit -m "feat(rotate): workspace create+switch rotation"
 - Consumes: everything from Tasks 2–7. `env` must provide: `API_KEY`, `NOTION_TOKEN_V2`, `NOTION_CLIENT_VERSION`, `NOTION_MODEL`, `REASONING_EFFORT`, `NOTION_USER_NAME`, `NOTION_USER_EMAIL`, `NOTION_TIMEZONE`, and optional `NOTION_SPACE_ID`; plus `STORE` (KV).
 - Produces: `POST /api/chat` SSE endpoint (and the kept `GET /health`).
 
-**Request:** `POST /api/chat`, header `Authorization: Bearer <API_KEY>`, JSON body `{ conversationId: string, message: string }`.
-**Response:** `text/event-stream` with `event: thinking`/`token` deltas, `event: done {answer}`, or `event: error {message}`.
+**Request:** `POST /api/chat`, header `Authorization: Bearer <API_KEY>`, JSON body `{ conversationId?: string, messages: [{role:"user"|"ai", text:string}, ...], message: string }`. `messages` = prior turns (the website owns them; `[]` on the first turn); `message` = the new user text. The Worker is **stateless for the transcript** — it stores NO chat history (only `state:activeSpace` in KV).
+**Response:** `text/event-stream` with `event: thinking`/`token` deltas, `event: done {answer}`, or `event: error {message}`. On `done`, the website appends `{role:"user",text:message}` + `{role:"ai",text:answer}` to its own `messages` for the next turn.
 
 - [ ] **Step 1: Replace `test/worker.test.mjs` with the failing integration tests**
 
@@ -1379,12 +1361,15 @@ async function postChat(body, headers = {}) {
   return res;
 }
 
+// notionMock returns helpers to inspect the last inference request body.
 function notionMock({ firstUnavailable = false }) {
   let inferenceCalls = 0;
+  let lastBody = null;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const req = new Request(input, init);
     if (req.url.endsWith("/runInferenceTranscript")) {
       inferenceCalls++;
+      lastBody = init?.body ? JSON.parse(init.body) : null;
       if (firstUnavailable && inferenceCalls === 1) {
         return new Response(unavailableNdjson, { headers: { "content-type": "application/x-ndjson" } });
       }
@@ -1394,12 +1379,11 @@ function notionMock({ firstUnavailable = false }) {
     if (req.url.endsWith("/getSpaces")) return new Response(JSON.stringify(getSpacesJson), { headers: { "content-type": "application/json" } });
     throw new Error("unexpected " + req.url);
   });
-  return { inferenceCalls: () => inferenceCalls };
+  return { inferenceCalls: () => inferenceCalls, lastBody: () => lastBody };
 }
 
 afterEach(() => vi.restoreAllMocks());
 beforeEach(async () => {
-  await env.STORE.delete("conv:c1");
   await env.STORE.delete("state:activeSpace");
   await env.STORE.put("state:activeSpace", JSON.stringify(ACTIVE));
 });
@@ -1415,11 +1399,15 @@ describe("GET /health", () => {
 describe("POST /api/chat auth + validation", () => {
   it("rejects wrong bearer with 401", async () => {
     notionMock({});
-    const res = await postChat({ conversationId: "c1", message: "hi" }, { authorization: "Bearer wrong" });
+    const res = await postChat({ messages: [], message: "hi" }, { authorization: "Bearer wrong" });
     expect(res.status).toBe(401);
   });
-  it("rejects missing conversationId with 400", async () => {
-    const res = await postChat({ message: "hi" });
+  it("rejects missing message with 400", async () => {
+    const res = await postChat({ messages: [] });
+    expect(res.status).toBe(400);
+  });
+  it("rejects a non-array messages with 400", async () => {
+    const res = await postChat({ messages: "hi", message: "x" });
     expect(res.status).toBe(400);
   });
   it("rejects non-POST / unknown path with 404", async () => {
@@ -1429,9 +1417,9 @@ describe("POST /api/chat auth + validation", () => {
 });
 
 describe("POST /api/chat streaming", () => {
-  it("streams thinking + token deltas then done and persists the turn", async () => {
+  it("streams thinking + token deltas then done (stateless: stores NO transcript)", async () => {
     notionMock({});
-    const res = await postChat({ conversationId: "c1", message: "hello" });
+    const res = await postChat({ conversationId: "c1", messages: [], message: "hello" });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
     const text = await res.text();
@@ -1439,16 +1427,38 @@ describe("POST /api/chat streaming", () => {
     expect(text).toContain("event: token");
     expect(text).toContain("event: done");
     expect(text).toContain("Hello, Ky!");
-    const stored = JSON.parse(await env.STORE.get("conv:c1"));
-    expect(stored.messages).toEqual([
-      { role: "user", text: "hello" },
-      { role: "ai", text: "Hello, Ky! 👋 Great to see you — how can I help today?" },
-    ]);
+    // stateless: no transcript key is ever written
+    expect(await env.STORE.get("conv:c1")).toBeNull();
+  });
+
+  it("replays the provided message history to Notion (multi-turn, full replay)", async () => {
+    const m = notionMock({});
+    const res = await postChat({
+      conversationId: "c2",
+      messages: [
+        { role: "user", text: "remember PINEAPPLE" },
+        { role: "ai", text: "got it" },
+      ],
+      message: "what did i say?",
+    });
+    expect(res.status).toBe(200);
+    const body = m.lastBody();
+    const t = body.transcript;
+    // config + context + 2 prior + 1 new = 5
+    expect(t).toHaveLength(5);
+    expect(t[0].type).toBe("config");
+    expect(t[1].type).toBe("context");
+    expect(t[2]).toMatchObject({ type: "user", value: [["remember PINEAPPLE"]] });
+    expect(t[3]).toMatchObject({ type: "ai", value: [["got it"]] });
+    expect(t[4]).toMatchObject({ type: "user", value: [["what did i say?"]] });
+    expect(body.createThread).toBe(true);
+    expect(body.isPartialTranscript).toBe(false);
+    expect(await env.STORE.get("conv:c2")).toBeNull();
   });
 
   it("rotates on credit exhaustion then retries on the new space", async () => {
     const m = notionMock({ firstUnavailable: true });
-    const res = await postChat({ conversationId: "c1", message: "hello" });
+    const res = await postChat({ conversationId: "c3", messages: [], message: "hello" });
     const text = await res.text();
     expect(m.inferenceCalls()).toBe(2); // 1st unavailable, 2nd hello
     expect(text).toContain("event: done");
@@ -1460,7 +1470,7 @@ describe("POST /api/chat streaming", () => {
   it("bootstraps the active space from getSpaces when none is stored", async () => {
     await env.STORE.delete("state:activeSpace");
     notionMock({});
-    const res = await postChat({ conversationId: "c1", message: "hello" });
+    const res = await postChat({ conversationId: "c4", messages: [], message: "hello" });
     const text = await res.text();
     expect(text).toContain("event: done");
     const active = JSON.parse(await env.STORE.get("state:activeSpace"));
@@ -1480,7 +1490,7 @@ Expected: FAIL (skeleton still returns 404/200; the chat tests fail).
 import { sse, PatchStream } from "./sse.js";
 import { buildInferenceBody, findNewSpace, findSpaceById } from "./transcript.js";
 import { callRunInference, ndjsonLines, getSpaces } from "./notion.js";
-import { loadTranscript, appendTurn, getActiveSpace, setActiveSpace } from "./store.js";
+import { getActiveSpace, setActiveSpace } from "./store.js";
 import { rotateWorkspace } from "./rotate.js";
 
 const MAX_ROTATION = 1;
@@ -1496,14 +1506,16 @@ export default {
     const auth = req.headers.get("authorization") || "";
     const key = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!key || key !== env.API_KEY) return json({ error: "unauthorized" }, 401);
-    // Parse body
+    // Parse body. The Worker is stateless for the transcript: the website sends the
+    // full message history (`messages`) each turn; the Worker stores no chat history.
     let body;
     try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
     const { conversationId, message } = body || {};
-    if (!conversationId || typeof message !== "string") {
-      return json({ error: "conversationId and message required" }, 400);
+    const messages = Array.isArray(body?.messages) ? body.messages : null;
+    if (typeof message !== "string" || messages === null) {
+      return json({ error: "message (string) and messages (array) required" }, 400);
     }
-    return streamChat({ env, ctx, conversationId, message });
+    return streamChat({ env, ctx, conversationId, messages, message });
   },
 };
 
@@ -1511,14 +1523,14 @@ function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
-async function streamChat({ env, ctx, conversationId, message }) {
+async function streamChat({ env, ctx, conversationId, messages, message }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
   const write = async (event, data) => { await writer.write(enc.encode(sse(event, data))); };
   const work = (async () => {
     try {
-      await runTurn({ env, conversationId, message, write });
+      await runTurn({ env, messages, message, write });
     } catch (e) {
       try { await write("error", { message: String(e?.message || e) }); } catch {}
     } finally {
@@ -1534,13 +1546,10 @@ async function streamChat({ env, ctx, conversationId, message }) {
   });
 }
 
-async function runTurn({ env, conversationId, message, write }) {
+async function runTurn({ env, messages, message, write }) {
   const kv = env.STORE;
   let activeSpace = await getActiveSpace(kv);
   if (!activeSpace) activeSpace = await bootstrapActiveSpace({ env, kv });
-
-  const prior = await loadTranscript(kv, conversationId);
-  const messages = prior.messages;
 
   for (let attempt = 0; attempt <= MAX_ROTATION; attempt++) {
     const body = buildInferenceBody({
@@ -1581,9 +1590,9 @@ async function runTurn({ env, conversationId, message, write }) {
       await write("error", { message: "Notion returned an incomplete response" });
       return;
     }
-    // success: persist user + ai turns, emit done
-    await appendTurn(kv, conversationId, { role: "user", text: message });
-    await appendTurn(kv, conversationId, { role: "ai", text: ps.answer });
+    // success: emit done. The Worker is stateless for the transcript — the website
+    // appends {role:"user",text:message} + {role:"ai",text:answer} to its own history
+    // and re-sends it as `messages` on the next turn (full replay).
     await write("done", { answer: ps.answer });
     return;
   }
@@ -1605,7 +1614,7 @@ async function bootstrapActiveSpace({ env, kv }) {
 - [ ] **Step 4: Run the test to verify it PASSES**
 
 Run: `npm test -- test/worker.test.mjs`
-Expected: 7 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Run the FULL suite to verify nothing regressed**
 
@@ -1635,7 +1644,7 @@ git commit -m "feat(worker): /api/chat SSE proxy with multi-turn replay + credit
 ````markdown
 # Notion Chat Proxy
 
-A Cloudflare Worker that exposes `POST /api/chat` and proxies messages to Notion's internal AI chat (`runInferenceTranscript`), streaming tokens back over SSE. Multi-turn memory is handled by replaying the full transcript each turn (the website owns the `conversationId`). When the current workspace runs out of AI credit, the Worker auto-creates a new workspace and switches to it.
+A Cloudflare Worker that exposes `POST /api/chat` and proxies messages to Notion's internal AI chat (`runInferenceTranscript`), streaming tokens back over SSE. Multi-turn memory is handled by **full replay**: the website owns the `conversationId` + the message history and sends the full `messages` array each turn (the Worker is **stateless for the transcript** — it stores no chat history, only the active workspace in KV). When the current workspace runs out of AI credit, the Worker auto-creates a new workspace and switches to it.
 
 > ⚠️ Workspace rotation to reset free-tier AI credit likely violates Notion's Terms of Service. Use at your own risk.
 
@@ -1667,16 +1676,24 @@ POST https://<your-worker>.workers.dev/api/chat
 Authorization: Bearer <API_KEY>
 Content-Type: application/json
 
-{ "conversationId": "abc123", "message": "hi" }
+{
+  "conversationId": "abc123",
+  "messages": [
+    { "role": "user", "text": "hi" },
+    { "role": "ai", "text": "hello!" }
+  ],
+  "message": "how are you"
+}
 ```
+- `messages` = the prior turns (the website keeps them to render the chat). Send `[]` on the first turn.
+- `message` = the new user text for this turn.
+- The Worker stores **no** chat history — it just replays `messages` + `message` to Notion and streams the answer back.
 
 Response is `text/event-stream`:
 - `event: thinking` — reasoning delta
 - `event: token` — answer delta
-- `event: done` — `data: {"answer": "..."}` (turn complete)
+- `event: done` — `data: {"answer": "..."}` (turn complete); the website then appends `{role:"user",text:message}` + `{role:"ai",text:answer}` to its own `messages` for the next turn
 - `event: error` — `data: {"message": "..."}`
-
-The website keeps `conversationId` per chat session; the Worker persists turns in KV (`conv:<conversationId>`) and replays them each turn so the AI remembers context.
 
 ## How it works
 
@@ -1684,9 +1701,9 @@ The website keeps `conversationId` per chat session; the Worker persists turns i
 - `src/sse.js` — turns patch `x` ops into `thinking`/`token` SSE deltas.
 - `src/transcript.js` — builds Notion request bodies (config/context/entries, createSpace, space discovery).
 - `src/notion.js` — HTTP client + line streamer.
-- `src/store.js` — KV transcript + active-space store.
+- `src/store.js` — KV active-space store (stateless transcript — no `conv:<id>` keys).
 - `src/rotate.js` — createSpace → poll getSpaces → switch (no delete).
-- `src/worker.js` — auth, routing, SSE response, runTurn (load → build → stream → rotate-on-credit → save).
+- `src/worker.js` — auth, routing, SSE response, runTurn (build from client `messages` → stream → rotate-on-credit → done).
 ````
 
 - [ ] **Step 2: Run the full suite once more**
@@ -1707,7 +1724,7 @@ git commit -m "docs: README with setup, deploy, and consumption guide"
 
 **1. Spec coverage** — checked against `docs/superpowers/specs/2026-08-05-notion-chat-proxy-design.md`:
 - Worker `POST /api/chat`, `Bearer API_KEY` auth (401), Bearer parse — Task 8. ✅
-- KV transcript `conv:<id>` + `state:activeSpace` — Task 6. ✅
+- KV active-space only (`state:activeSpace`) — Task 6 (no `conv:<id>` transcript; the website sends `messages` each turn, so the Worker is stateless for the transcript). ✅
 - SSE `thinking`/`token`/`done`/`error` contract — Task 3 + Task 8. ✅
 - Full-replay body (config + context + user/ai entries + new user, `createThread:true`, `isPartialTranscript:false`, `asPatchResponse:true`, `patchResponseVersion:2`, `threadParentPointer`, `debugOverrides`, etc.) — Task 4 `buildInferenceBody`. ✅
 - Config `fireworks-kimi-k3` + `reasoningEffort:"max"` (full captured config) — Task 4 `DEFAULT_CONFIG`/`buildConfig`. ✅
@@ -1721,6 +1738,6 @@ git commit -m "docs: README with setup, deploy, and consumption guide"
 
 **2. Placeholder scan** — searched the plan for `TBD`, `TODO`, `implement later`, `fill in`, `appropriate error handling`, `similar to`: none present. Every code step has complete code. The only fill-in values are real infrastructure the operator provisions (`wrangler.toml` KV `id`, `.dev.vars` secrets) — documented with the exact `wrangler kv namespace create` commands; tests do not depend on them.
 
-**3. Type/name consistency** — `applyOp`, `applyNdjson`, `extractAnswer`, `isCreditUnavailable`, `isFinished`, `creditLimit` (Task 2) are used unchanged in Task 3 (`PatchStream` imports `applyOp`, `extractAnswer`) and asserted in Task 8 indirectly. `sse`, `PatchStream` (Task 3) used in Task 8 (`streamChat`/`runTurn`). `nid`, `DEFAULT_CONFIG`, `buildConfig`, `buildContext`, `buildUserEntry`, `buildAiEntry`, `buildInferenceBody`, `buildCreateSpaceBody`, `findNewSpace`, `findSpaceById` (Task 4) — `buildInferenceBody`/`buildCreateSpaceBody`/`findNewSpace` used in Tasks 5/7/8; `findSpaceById` used in Task 8 bootstrap. `NOTION_BASE`, `notionHeaders`, `callRunInference`, `ndjsonLines`, `getSpaces`, `createSpace` (Task 5) used in Tasks 7/8. `loadTranscript`, `saveTranscript`, `appendTurn`, `getActiveSpace`, `setActiveSpace` (Task 6) used in Tasks 7/8. `rotateWorkspace({ env, kv, currentSpace, pollMs })` (Task 7) called exactly so in Task 8. Record shape `{ spaceId, spaceViewId, name, userId }` is consistent across `findNewSpace`/`findSpaceById`/`setActiveSpace`/`rotateWorkspace`/`bootstrapActiveSpace`. `env` var names (`API_KEY`, `NOTION_TOKEN_V2`, `NOTION_CLIENT_VERSION`, `NOTION_MODEL`, `REASONING_EFFORT`, `NOTION_USER_NAME`, `NOTION_USER_EMAIL`, `NOTION_TIMEZONE`, `NOTION_SPACE_ID`) match between `vitest.config.mjs` (vars), `worker.js` (reads), and `.dev.vars.example`. ✅
+**3. Type/name consistency** — `applyOp`, `applyNdjson`, `extractAnswer`, `isCreditUnavailable`, `isFinished`, `creditLimit` (Task 2) are used unchanged in Task 3 (`PatchStream` imports `applyOp`, `extractAnswer`) and asserted in Task 8 indirectly. `sse`, `PatchStream` (Task 3) used in Task 8 (`streamChat`/`runTurn`). `nid`, `DEFAULT_CONFIG`, `buildConfig`, `buildContext`, `buildUserEntry`, `buildAiEntry`, `buildInferenceBody`, `buildCreateSpaceBody`, `findNewSpace`, `findSpaceById` (Task 4) — `buildInferenceBody`/`buildCreateSpaceBody`/`findNewSpace` used in Tasks 5/7/8; `findSpaceById` used in Task 8 bootstrap. `NOTION_BASE`, `notionHeaders`, `callRunInference`, `ndjsonLines`, `getSpaces`, `createSpace` (Task 5) used in Tasks 7/8. `getActiveSpace`, `setActiveSpace` (Task 6) used in Tasks 7/8 (no `loadTranscript`/`saveTranscript`/`appendTurn` — the Worker is stateless for the transcript; the website owns `messages`). `rotateWorkspace({ env, kv, currentSpace, pollMs })` (Task 7) called exactly so in Task 8. Record shape `{ spaceId, spaceViewId, name, userId }` is consistent across `findNewSpace`/`findSpaceById`/`setActiveSpace`/`rotateWorkspace`/`bootstrapActiveSpace`. `env` var names (`API_KEY`, `NOTION_TOKEN_V2`, `NOTION_CLIENT_VERSION`, `NOTION_MODEL`, `REASONING_EFFORT`, `NOTION_USER_NAME`, `NOTION_USER_EMAIL`, `NOTION_TIMEZONE`, `NOTION_SPACE_ID`) match between `vitest.config.mjs` (vars), `worker.js` (reads), and `.dev.vars.example`. ✅
 
 No issues found. Plan is implementable as written.

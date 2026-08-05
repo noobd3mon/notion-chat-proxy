@@ -5,12 +5,12 @@ Status: Draft (pending user review)
 
 ## Mục tiêu
 
-Một serverless function `POST /api/chat` trên Cloudflare Worker, đóng vai trò proxy tới AI chat nội bộ của Notion (`runInferenceTranscript`, v3 internal API, auth bằng cookie `token_v2`). Dùng cho một trang web có sẵn (web của user đã tự quản lý `conversationId`). Phản hồi stream từng chữ như chat thật. Hỗ trợ nhớ ngữ cảnh đa lượt. Tự xoay workspace (tạo mới / xóa cũ) khi workspace hiện tại hết credit AI.
+Một serverless function `POST /api/chat` trên Cloudflare Worker, đóng vai trò proxy tới AI chat nội bộ của Notion (`runInferenceTranscript`, v3 internal API, auth bằng cookie `token_v2`). Dùng cho một trang web có sẵn (web của user đã tự quản lý `conversationId` + lịch sử chat). Phản hồi stream từng chữ như chat thật. Hỗ trợ nhớ ngữ cảnh đa lượt bằng **full replay** (web gửi lại toàn bộ history mỗi lượt — worker KHÔNG lưu transcript, tránh KV read quá nhiều). Tự xoay workspace (tạo mới + chuyển, không xóa) khi workspace hiện tại hết credit AI.
 
 ## Phạm vi
 
-- Bao gồm: endpoint `/api/chat` (SSE), lưu transcript theo `conversationId`, streaming, continue/poll cho agent đa bước, xoay workspace.
-- Không bao gồm: UI chat (web của user tự lo), SDK integration (chỉ tham khảo pattern).
+- Bao gồm: endpoint `/api/chat` (SSE), streaming, xoay workspace reactive khi hết credit. Transcript do web giữ gửi lại mỗi lượt — worker stateless cho transcript (chỉ 1 KV read `state:activeSpace`/lượt).
+- Không bao gồm: UI chat (web của user tự lo — web tự giữ history để render + gửi lại), SDK integration (chỉ tham khảo pattern), continue/poll đa bước (Notion trả 1 call đầy đủ khi còn credit; rỗng = hết credit, không phải multi-step).
 
 ## Nghiên cứu đã xác nhận (test bằng token thật)
 
@@ -22,7 +22,7 @@ Một serverless function `POST /api/chat` trên Cloudflare Worker, đóng vai t
 | Answer | `s[i].type==="agent-inference"` → `value[]`: `{type:"thinking",content}` + `{type:"text",content}`. Content build dần bằng op `x` trên `/s/N/value/M/content` |
 | Hoàn thành | patch thêm `finishedAt` vào `agent-inference` |
 | Multi-turn | Replay đầy đủ transcript mỗi lượt → HOẠT ĐỘNG, AI nhớ đúng secret word. Entry assistant = `{id,type:"ai",userId,value:[["<text>"]],createdAt}` |
-| Cơ chế "pointer" của Notion | Web app dùng `createThread:false` + `isPartialTranscript:true` + cùng `threadId` (kèm `updated-config`, 2 context, giữ nguyên config/context ID) để tiếp tục — KHÔNG replay history. NHƯNG test qua API: luôn trả body `[` (degenerate, 200) cho thread tạo bằng API → pointer chỉ loadable với thread tạo qua UI thật (cần ai_thread record persist qua flow đầy đủ). Vậy proxy dùng **full replay** |
+| Cơ chế "pointer" của Notion | Web app dùng `createThread:false` + `isPartialTranscript:true` + cùng `threadId` để tiếp tục — KHÔNG replay history. NHƯNG test qua API: luôn trả body `[` (degenerate, 200) cho thread tạo bằng API (re-verify lần 2: cả threadId gửi đi lẫn threadId trả về — Notion trả `threadId:null`, không có id thay thế). Cũng KHÔNG có endpoint nào lấy lại transcript (`getThread`/`getThreads`/`loadThreadState`/`getThreadRecords`/`getAgentThread` → 404; `syncRecordValues` table `thread` → rỗng — thread API-tạo không persist vào record). Vậy history BẮT BUỘC do web giữ + gửi lại mỗi lượt (full replay) |
 | Đa bước / Credit | Phát hiện quan trọng: response "rỗng" KHÔNG phải multi-step mà là **HẾT CREDIT**. Patch đầu = `type:"premium-feature-unavailable"`, `featureAvailability.type:"unavailable"`, `limit:{type:"cumulative",current:79,total:75}`. Khi còn credit → 1 call trả đầy đủ (tools + inference + `finishedAt`) → **không cần continue/poll**. Rỗng = trigger xoay workspace (đã confirm, không còn TBD) |
 | Workspace | `getSpaces` (200). `createSpace` schema đã biết (camelCase) + tạo space mới có **credit tươi** (AI trả answer đầy) → rotation confirm. "Delete workspace" = client-side, không có server API → bỏ qua. |
 | Credit trigger | `premium-feature-unavailable` (`limit.current>total`) khi hết credit; `finished=true`+answer khi còn. Reactive rotation đã test OK end-to-end |
@@ -31,27 +31,26 @@ Một serverless function `POST /api/chat` trên Cloudflare Worker, đóng vai t
 ## Kiến trúc
 
 ```
-Web (conversationId, message) ──Bearer API_KEY──▶ Worker POST /api/chat
-                                                      │ NOTION_TOKEN_V2 = secret
-                                                      │ KV: conv:<id> = transcript, state:activeSpace
-                                                      ▼
-   load transcript → append user → runInferenceTranscript → stream patches → SSE
+Web (conversationId, messages[], message) ──Bearer API_KEY──▶ Worker POST /api/chat
+                                                                    │ NOTION_TOKEN_V2 = secret
+                                                                    │ KV: state:activeSpace (1 read/turn)
+                                                                    ▼
+   build transcript = config + context + messages[] + message → runInferenceTranscript → stream patches → SSE
         └─ patch premium-feature-unavailable ⇒ rotate workspace ⇒ retry 1 lần
         └─ có agent-inference + finishedAt ⇒ stream text/thinking → done
-        └─ xong ⇒ append {type:"ai", value:[[answer]]} ⇒ save KV ⇒ event: done
+        └─ xong ⇒ event: done {answer} (Worker KHÔNG lưu transcript — web tự append {user,message}+{ai,answer} vào history của nó để gửi lại lượt sau)
 ```
 
 ### Thành phần
 
 1. **Auth layer**: validate `Authorization: Bearer API_KEY` (env `API_KEY`). 401 nếu sai.
-2. **Transcript store (KV)**:
-   - `conv:<conversationId>` → `{version, messages:[{role:"user"|"ai", text}]}`.
-   - `state:activeSpace` → spaceId đang dùng.
-   - `state:spaces` → list space đã tạo (để dọn dẹp).
+2. **KV store (chỉ active space)** — KHÔNG lưu transcript:
+   - `state:activeSpace` → `{ spaceId, spaceViewId, name, userId }` đang dùng (1 read/lượt; write chỉ khi rotate).
+   - Transcript do **web giữ** và gửi lại mỗi lượt (`messages[]`), worker stateless cho transcript → tránh KV read quá nhiều (lo ngại rate limit KV).
 3. **Notion caller**: build body, POST, stream.
-4. **Patch → SSE translator**: parse NDJSON, bóc `x` content delta → SSE event.
-5. **Continue loop**: nếu stream hết mà chưa có `finishedAt`-inference → gửi continuation.
-6. **Workspace rotator**: create/delete space khi hết credit.
+4. **Patch → SSE translator**: parse NDJSON, bóc `x`/snapshot content delta → SSE event.
+5. **Không cần continue/poll**: khi còn credit, 1 call `runInferenceTranscript` trả đầy đủ (inference + `finishedAt`). Stream hết mà chưa `finishedAt` = hết credit → rotate (xem #6).
+6. **Workspace rotator**: create+switch space khi hết credit (không xóa — delete là client-side, không có server API).
 
 ### Request / Response
 
@@ -60,12 +59,16 @@ Request:
 POST /api/chat
 Authorization: Bearer <API_KEY>
 Content-Type: application/json
-{ "conversationId": "abc", "message": "hi" }
+{ "conversationId": "abc",
+  "messages": [ {"role":"user","text":"hi"}, {"role":"ai","text":"hello"} ],
+  "message": "how are you" }
 ```
+- `messages[]` = các lượt TRƯỚC (web tự giữ để render UI + gửi lại mỗi lượt). `message` = text user mới lượt này. Worker KHÔNG lưu/persist transcript.
+- Lượt đầu tiên: `messages: []`, `message: "hi"`.
 Response `text/event-stream`:
 - `event: thinking` `data: <delta>` — reasoning (optional)
 - `event: token` `data: <delta>` — answer delta
-- `event: done` `data: {"answer":"..."}` — turn complete
+- `event: done` `data: {"answer":"..."}` — turn complete; web tự append `{role:"user",text:message}` + `{role:"ai",text:answer}` vào history của nó để gửi lại lượt sau
 - `event: error` `data: {"message":"..."}`
 
 ### Body gửi Notion (mỗi lượt, fresh IDs)
@@ -136,20 +139,21 @@ Bằng chứng (test token thật): space cũ `319d7f78...` trả `premium-featu
 - **Hết credit**: tín hiệu đã confirm = patch `premium-feature-unavailable` (`featureAvailability.type:"unavailable"`, `limit.current > limit.total`). Worker rotate workspace + retry 1 lần; vẫn unavailable → trả error.
 - **createSpace**: schema đã biết (camelCase: name, planType, planSelection, initialPersona, domainType, deviceId, deviceType, source). Có rate limit 429 → wait+retry. AI trên space mới có credit tươi đã confirm.
 - **Xóa workspace**: thao tác client-side, không có server API → bỏ qua. Rotation chỉ create+switch. (Nếu sau này `validateUserCanCreateWorkspace` báo tới giới hạn số space thì mới cần xử lý thêm.)
-- **Cơ chế pointer không dùng được qua API**: đã xác nhận `createThread:false`+`isPartialTranscript` trả `[` với thread tạo bằng API → dùng full replay. Nếu sau này replicate flow tạo thread của UI thì có thể chuyển sang pointer cho hiệu quả hơn.
+- **Cơ chế pointer không dùng được qua API**: đã xác nhận (re-verify lần 2) `createThread:false`+`isPartialTranscript` trả `[` với thread tạo bằng API, dù dùng threadId gửi đi hay trả về (Notion trả `threadId:null`). Cũng không có endpoint nào lấy lại transcript đã lưu (`getThread`/`getThreads`/`loadThreadState`/`getThreadRecords`/`getAgentThread` → 404; `syncRecordValues` table `thread` → rỗng). Vậy history **bắt buộc do web giữ** và gửi lại mỗi lượt (full replay) — worker stateless cho transcript, tránh KV read quá nhiều. Nếu sau này replicate flow tạo thread của UI thật thì có thể chuyển sang pointer cho hiệu quả hơn.
 
 ## Cấu trúc file dự kiến (sau khi code)
 
 ```
 src/
-  index.js         // Worker entry: route /api/chat, auth, SSE
-  notion.js        // build body, call runInferenceTranscript, patch parser
-  transcript.js    // KV load/save, rebuild transcript
-  rotate.js        // workspace create/delete/getSpaces
-  sse.js           // patch delta -> SSE
-  config.js        // config/context builders, env
+  worker.js        // Worker entry: route /api/chat, auth, SSE, runTurn (stateless transcript)
+  notion.js        // HTTP client: callRunInference, ndjsonLines, getSpaces, createSpace
+  transcript.js    // body builders: config/context/entries, buildInferenceBody, findNewSpace/findSpaceById
+  store.js         // KV active-space store (KHÔNG lưu transcript — chỉ state:activeSpace)
+  rotate.js        // workspace rotation: createSpace + poll getSpaces + switch (không xóa)
+  sse.js           // SSE encoder + PatchStream (patch delta -> thinking/token)
+  patch.js         // NDJSON JSON-Patch applier (pure)
 wrangler.toml      // binding KV, vars
-test/              // vitest: patch parser, transcript rebuild, SSE
+test/              // vitest: patch, sse, transcript, notion, store, rotate, worker
 ```
 
 ## Out of scope
