@@ -1,0 +1,7 @@
+# Copy to .dev.vars (gitignored) and fill with real values for `wrangler dev`.
+NOTION_TOKEN_V2=v03:replace-with-real-token_v2
+API_KEY=replace-with-your-secret-worker-key
+NOTION_USER_NAME=Your Name
+NOTION_USER_EMAIL=you@example.com
+# Optional initial space (bootstrap derives it from getSpaces if absent):
+NOTION_SPACE_ID=

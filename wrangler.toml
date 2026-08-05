@@ -1,0 +1,18 @@
+name = "notion-chat-proxy"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+# Create the KV namespace once, then paste the real id below (deploy only).
+#   npx wrangler kv namespace create STORE
+#   npx wrangler kv namespace create STORE --preview
+# `wrangler dev` works with the placeholder id (local miniflare KV).
+[[kv_namespaces]]
+binding = "STORE"
+id = "00000000000000000000000000000000"
+preview_id = "00000000000000000000000000000000"
+
+[vars]
+NOTION_CLIENT_VERSION = "23.13.20260805.0803"
+NOTION_MODEL = "fireworks-kimi-k3"
+REASONING_EFFORT = "max"
+NOTION_TIMEZONE = "Asia/Saigon"
