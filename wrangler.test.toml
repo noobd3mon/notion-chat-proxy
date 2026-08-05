@@ -1,0 +1,19 @@
+# wrangler.test.toml — test-only worker config. Fake values (NOT real secrets);
+# safe to commit. Read by vitest.config.mjs to populate the test env.
+name = "notion-chat-proxy-test"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+[[kv_namespaces]]
+binding = "STORE"
+id = "test-store-id"
+
+[vars]
+API_KEY = "k"
+NOTION_TOKEN_V2 = "test-token"
+NOTION_CLIENT_VERSION = "23.13.20260805.0803"
+NOTION_MODEL = "fireworks-kimi-k3"
+REASONING_EFFORT = "max"
+NOTION_USER_NAME = "Ky"
+NOTION_USER_EMAIL = "ky@example.com"
+NOTION_TIMEZONE = "Asia/Saigon"
