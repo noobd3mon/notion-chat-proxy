@@ -63,7 +63,7 @@ function makeEnv() {
     NOTION_TOKEN_V2: process.env.NOTION_TOKEN_V2 || "",
     NOTION_CLIENT_VERSION: process.env.NOTION_CLIENT_VERSION || "23.13.20260805.2047",
     NOTION_MODEL: process.env.NOTION_MODEL || "fireworks-kimi-k3",
-    REASONING_EFFORT: process.env.REASONING_EFFORT || "max",
+    REASONING_EFFORT: process.env.REASONING_EFFORT || "high",
     NOTION_USER_NAME: process.env.NOTION_USER_NAME || "Ky",
     NOTION_USER_EMAIL: process.env.NOTION_USER_EMAIL || "",
     NOTION_TIMEZONE: process.env.NOTION_TIMEZONE || "Asia/Saigon",

@@ -45,7 +45,7 @@ docker push <your-dockerhub-user>/notion-chat-proxy:latest
    - `NOTION_TOKEN_V2` — your `token_v2` cookie value (the secret).
    - `NOTION_USER_NAME`, `NOTION_USER_EMAIL` — your Notion display name + email.
    - `NOTION_TIMEZONE` (default `Asia/Saigon`).
-   - `NOTION_MODEL` (default `fireworks-kimi-k3`), `REASONING_EFFORT` (default `max`).
+   - `NOTION_MODEL` (default `fireworks-kimi-k3`), `REASONING_EFFORT` (default `high`).
    - `NOTION_CLIENT_VERSION` (default `23.13.20260805.2047`).
    - `NOTION_SPACE_ID` (optional — initial space; if omitted, the worker picks the newest from `getSpaces`).
    - `ENABLE_WEB_RESEARCH` / `ENABLE_INTERNET_ACCESS` (default `true` / `true`) — set either to `false` to disable web search (and thus the `event: sources` feature).
