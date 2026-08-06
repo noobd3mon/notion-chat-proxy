@@ -46,7 +46,7 @@ Content-Type: application/json
 - `messages` = the prior turns (the website keeps them to render the chat). Send `[]` on the first turn.
 - `message` = the new user text for this turn.
 - `model` (optional) = a Notion model codename from `GET /api/models`. Defaults to `NOTION_MODEL` (`fireworks-kimi-k3`). When set to something other than the default, the Worker validates it against the available list and rejects disabled/unknown models with `400`.
-- `contextPageId` (optional) = a Notion block id of the page the chat is anchored to. Sent as `context_page_id` in the Notion context when a non-empty string is provided, omitted otherwise. In ask mode Notion ignores it server-side; it's passed only to match the real request shape.
+- `contextPageId` (optional) = a Notion block id of a page whose content Notion loads as instructions/context for the AI. This is an explicit designation (not a workspace search), so it works in ask mode: the AI follows this page + its own knowledge + web search, without searching the workspace or help center. Sent as `context_page_id` when a non-empty string is provided, omitted otherwise.
 - The Worker stores **no** chat history — it just replays `messages` + `message` to Notion and streams the answer back.
 
 Response is `text/event-stream`:

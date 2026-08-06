@@ -52,12 +52,15 @@ export function buildContext({ userId, spaceId, spaceViewId, spaceName, userName
     timezone, userName, userId, userEmail,
     spaceName, spaceId, spaceViewId, currentDatetime: now, surface: "ai_module",
   };
-  // Optional per-request context page (the Notion block id of the page the chat
-  // is anchored to). Ask mode passes this even when searchScopes is "ai-knowledge"
-  // + useReadOnlyMode is true (capture from app.notion.com/ai) — included verbatim
+  // Optional per-request context page (the Notion block id of a page whose
+  // content Notion loads as instructions/context for the AI). This is an
+  // EXPLICIT designation, distinct from `searchScopes` (workspace search), so it
+  // applies alongside ask mode: the AI follows this page + its own knowledge +
+  // web search, but does NOT search the workspace or help center. The ask-mode
+  // capture from app.notion.com/ai sends context_page_id even with
+  // searchScopes ai-knowledge + useReadOnlyMode true. Included verbatim (trimmed)
   // when a non-empty string is provided, omitted entirely otherwise
-  // ("không có thì không dùng, có thì sẽ dùng"). Notion ignores it server-side in
-  // ask mode, but we match the real shape to avoid validation surprises.
+  // ("không có thì không dùng, có thì sẽ dùng").
   if (typeof contextPageId === "string" && contextPageId.trim()) {
     ctx.context_page_id = contextPageId.trim();
   }
