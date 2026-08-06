@@ -9,6 +9,43 @@ describe("sse encoder", () => {
   it("encodes string data verbatim", () => {
     expect(sse("token", "abc")).toBe("event: token\ndata: abc\n\n");
   });
+  it("encodes multi-line string data as repeated data: lines", () => {
+    expect(sse("token", "a\nb\nc")).toBe("event: token\ndata: a\ndata: b\ndata: c\n\n");
+  });
+  it("preserves leading and trailing newlines in string data", () => {
+    expect(sse("token", "\nWorld")).toBe("event: token\ndata: \ndata: World\n\n");
+    expect(sse("token", "para2\n")).toBe("event: token\ndata: para2\ndata: \n\n");
+  });
+  it("reformats to a spec-compliant client exactly recovers the original string", () => {
+    // WHATWG dispatch parser: split on \n, blank line dispatches; `data:` lines
+    // accumulate with a \n between each, then one trailing \n is stripped.
+    const parse = (buf) => {
+      const out = [];
+      let data = "", type = "message";
+      for (const raw of buf.split("\n")) {
+        const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+        if (line === "") {
+          if (data !== "") out.push({ type, data: data.endsWith("\n") ? data.slice(0, -1) : data });
+          data = ""; type = "message";
+          continue;
+        }
+        if (line.startsWith(":")) continue;
+        const ci = line.indexOf(":");
+        const field = ci === -1 ? line : line.slice(0, ci);
+        const value = ci === -1 ? "" : line.slice(ci + 1).replace(/^ /, "");
+        if (field === "event") type = value;
+        else if (field === "data") data += value + "\n";
+      }
+      return out;
+    };
+    const cases = ["abc", "a\nb\nc", "\nWorld", "para2\n", "line1\nline2", "\n", "Hello, Ky!\nHow are you?\n"];
+    for (const c of cases) {
+      const evs = parse(sse("token", c));
+      expect(evs).toHaveLength(1);
+      expect(evs[0].type).toBe("token");
+      expect(evs[0].data).toBe(c);
+    }
+  });
 });
 
 describe("PatchStream", () => {

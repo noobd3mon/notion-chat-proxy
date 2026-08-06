@@ -19,7 +19,14 @@ import { extractSources } from "./sources.js";
 
 export function sse(event, data) {
   const payload = typeof data === "string" ? data : JSON.stringify(data);
-  return `event: ${event}\ndata: ${payload}\n\n`;
+  // A `data:` field value runs only to the end of its line, so a `\n` inside the
+  // payload would split the SSE block and a spec-compliant client would drop
+  // everything after the first newline (and the newline itself). Encode multi-
+  // line data as consecutive `data:` lines — the client reassembles them with
+  // `\n` between each, recovering the original payload. Single-line payloads
+  // (the common case, including all JSON via JSON.stringify) are unchanged.
+  const dataLines = payload.split("\n").map((l) => `data: ${l}`).join("\n");
+  return `event: ${event}\n${dataLines}\n\n`;
 }
 
 const FINISHED_RE = /^\/s\/(\d+)\/finishedAt$/;
