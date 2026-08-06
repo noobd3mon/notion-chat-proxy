@@ -47,11 +47,21 @@ export function buildConfig({ model = "fireworks-kimi-k3", reasoningEffort = "ma
   return { ...DEFAULT_CONFIG, model, reasoningEffort };
 }
 
-export function buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone = "Asia/Saigon", now }) {
-  return {
+export function buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone = "Asia/Saigon", now, contextPageId }) {
+  const ctx = {
     timezone, userName, userId, userEmail,
     spaceName, spaceId, spaceViewId, currentDatetime: now, surface: "ai_module",
   };
+  // Optional per-request context page (the Notion block id of the page the chat
+  // is anchored to). Ask mode passes this even when searchScopes is "ai-knowledge"
+  // + useReadOnlyMode is true (capture from app.notion.com/ai) — included verbatim
+  // when a non-empty string is provided, omitted entirely otherwise
+  // ("không có thì không dùng, có thì sẽ dùng"). Notion ignores it server-side in
+  // ask mode, but we match the real shape to avoid validation surprises.
+  if (typeof contextPageId === "string" && contextPageId.trim()) {
+    ctx.context_page_id = contextPageId.trim();
+  }
+  return ctx;
 }
 
 export function buildUserEntry({ id, userId, text, now }) {
@@ -65,12 +75,12 @@ export function buildAiEntry({ id, userId, text, now }) {
 // `messages` = prior turns [{role:"user"|"ai", text}]; `message` = new user text.
 export function buildInferenceBody({
   spaceId, userId, spaceViewId, spaceName, userName, userEmail, timezone,
-  messages = [], message, model, reasoningEffort,
+  messages = [], message, model, reasoningEffort, contextPageId,
 }) {
   const now = new Date().toISOString();
   const transcript = [
     { id: nid(), type: "config", value: buildConfig({ model, reasoningEffort }) },
-    { id: nid(), type: "context", value: buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone, now }) },
+    { id: nid(), type: "context", value: buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone, now, contextPageId }) },
   ];
   for (const m of messages) {
     if (m.role === "user") transcript.push(buildUserEntry({ id: nid(), userId, text: m.text, now }));

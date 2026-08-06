@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, buildConfig,
+  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, buildConfig, buildContext,
 } from "../src/transcript.js";
 import getSpacesJson from "./fixtures/getSpaces.json";
 
@@ -25,6 +25,28 @@ describe("buildConfig", () => {
     expect(c.availableConnectors).toEqual([]);
     expect(c.useWebSearch).toBe(true);
     expect(c.enableComputer).toBe(false);
+  });
+});
+
+describe("buildContext", () => {
+  const base = {
+    userId: "U", spaceId: "S", spaceViewId: "SV", spaceName: "Space",
+    userName: "Ky", userEmail: "ky@example.com", timezone: "Asia/Saigon",
+    now: "2026-08-06T08:00:00.000+07:00",
+  };
+  it("emits a single ai_module context with no context_page_id by default", () => {
+    const ctx = buildContext(base);
+    expect(ctx.surface).toBe("ai_module");
+    expect(ctx).not.toHaveProperty("context_page_id");
+  });
+  it("includes context_page_id (trimmed) when a non-empty string is provided", () => {
+    const ctx = buildContext({ ...base, contextPageId: "  page-abc-123  " });
+    expect(ctx.context_page_id).toBe("page-abc-123");
+  });
+  it("omits context_page_id for empty/whitespace/non-string values", () => {
+    for (const v of ["", "   ", null, undefined, 123, true]) {
+      expect(buildContext({ ...base, contextPageId: v })).not.toHaveProperty("context_page_id");
+    }
   });
 });
 
@@ -54,6 +76,7 @@ describe("buildInferenceBody", () => {
     expect(t[0].value.model).toBe("fireworks-kimi-k3");
     expect(t[1].type).toBe("context");
     expect(t[1].value).toMatchObject({ spaceId: "S", spaceViewId: "SV", userName: "Ky", surface: "ai_module" });
+    expect(t[1].value).not.toHaveProperty("context_page_id");
     expect(t[2]).toMatchObject({ type: "user", value: [["hi"]] });
     expect(t[3]).toMatchObject({ type: "ai", value: [["hello"]] });
     expect(t[4]).toMatchObject({ type: "user", value: [["how are you"]] });
@@ -61,6 +84,16 @@ describe("buildInferenceBody", () => {
     // all entry ids unique
     const ids = t.map((e) => e.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("forwards contextPageId into the context as context_page_id", () => {
+    const body = buildInferenceBody({
+      spaceId: "S", userId: "U", spaceViewId: "SV", spaceName: "Space",
+      userName: "Ky", userEmail: "ky@example.com", timezone: "Asia/Saigon",
+      messages: [], message: "hi", model: "fireworks-kimi-k3", reasoningEffort: "max",
+      contextPageId: "page-xyz",
+    });
+    expect(body.transcript[1].value.context_page_id).toBe("page-xyz");
   });
 });
 

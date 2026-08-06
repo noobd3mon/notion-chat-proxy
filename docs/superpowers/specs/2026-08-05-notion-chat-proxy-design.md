@@ -68,9 +68,10 @@ Content-Type: application/json
 { "conversationId": "abc",
   "messages": [ {"role":"user","text":"hi"}, {"role":"ai","text":"hello"} ],
   "message": "how are you",
-  "model": "fireworks-kimi-k3" }
+  "model": "fireworks-kimi-k3",
+  "contextPageId": "optional-page-block-id" }
 ```
-- `messages[]` = các lượt TRƯỚC (web tự giữ để render UI + gửi lại mỗi lượt). `message` = text user mới lượt này. Worker KHÔNG lưu/persist transcript. `model` (optional) = codename từ `GET /api/models` (mặc định `NOTION_MODEL`); khác default thì worker validate trước khi stream.
+- `messages[]` = các lượt TRƯỚC (web tự giữ để render UI + gửi lại mỗi lượt). `message` = text user mới lượt này. Worker KHÔNG lưu/persist transcript. `model` (optional) = codename từ `GET /api/models` (mặc định `NOTION_MODEL`); khác default thì worker validate trước khi stream. `contextPageId` (optional) = block id Notion của page context; có (non-empty string) thì đưa `context_page_id` vào context (ask mode Notion bỏ qua server-side, nhưng match shape thật — capture `app.notion.com/ai` vẫn gửi dù `searchScopes: ai-knowledge`+`useReadOnlyMode`), không thì bỏ hẳn.
 - Lượt đầu tiên: `messages: []`, `message: "hi"`.
 Response `text/event-stream`:
 - `event: thinking` `data: <delta>` — reasoning (optional)

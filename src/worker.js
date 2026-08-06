@@ -52,7 +52,7 @@ export default {
         // model and let Notion reject it if it's invalid.
       }
     }
-    return streamChat({ env, ctx, conversationId, messages, message, model, activeSpace });
+    return streamChat({ env, ctx, conversationId, messages, message, model, contextPageId: body.contextPageId, activeSpace });
   },
 };
 
@@ -80,14 +80,14 @@ function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
-async function streamChat({ env, ctx, conversationId, messages, message, model, activeSpace }) {
+async function streamChat({ env, ctx, conversationId, messages, message, model, contextPageId, activeSpace }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
   const write = async (event, data) => { await writer.write(enc.encode(sse(event, data))); };
   const work = (async () => {
     try {
-      await runTurn({ env, kv: env.STORE, activeSpace, messages, message, model, write });
+      await runTurn({ env, kv: env.STORE, activeSpace, messages, message, model, contextPageId, write });
     } catch (e) {
       try { await write("error", { message: String(e?.message || e) }); } catch {}
     } finally {
@@ -103,13 +103,13 @@ async function streamChat({ env, ctx, conversationId, messages, message, model, 
   });
 }
 
-async function runTurn({ env, kv, activeSpace, messages, message, model, write }) {
+async function runTurn({ env, kv, activeSpace, messages, message, model, contextPageId, write }) {
   for (let attempt = 0; attempt <= MAX_ROTATION; attempt++) {
     const body = buildInferenceBody({
       spaceId: activeSpace.spaceId, userId: activeSpace.userId, spaceViewId: activeSpace.spaceViewId,
       spaceName: activeSpace.name, userName: env.NOTION_USER_NAME, userEmail: env.NOTION_USER_EMAIL,
       timezone: env.NOTION_TIMEZONE, messages, message,
-      model, reasoningEffort: env.REASONING_EFFORT,
+      model, reasoningEffort: env.REASONING_EFFORT, contextPageId,
     });
     const res = await callRunInference({
       token: env.NOTION_TOKEN_V2, userId: activeSpace.userId, spaceId: activeSpace.spaceId,

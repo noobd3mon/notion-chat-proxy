@@ -255,3 +255,22 @@ describe("POST /api/chat per-request model", () => {
     expect(m.lastBody().transcript[0].value.model).toBe("fireworks-kimi-k3");
   });
 });
+
+describe("POST /api/chat contextPageId (optional context_page_id)", () => {
+  it("forwards contextPageId into the Notion context as context_page_id", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChat({ messages: [], message: "hi", contextPageId: "page-abc" });
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    const ctxEntry = m.lastBody().transcript.find((e) => e.type === "context");
+    expect(ctxEntry.value.context_page_id).toBe("page-abc");
+  });
+  it("omits context_page_id when contextPageId is not sent", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChat({ messages: [], message: "hi" });
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    const ctxEntry = m.lastBody().transcript.find((e) => e.type === "context");
+    expect(ctxEntry.value).not.toHaveProperty("context_page_id");
+  });
+});
