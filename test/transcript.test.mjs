@@ -38,6 +38,11 @@ describe("buildInferenceBody", () => {
     expect(body.patchResponseVersion).toBe(2);
     expect(body.threadParentPointer).toEqual({ table: "space", id: "S", spaceId: "S" });
     expect(body.threadType).toBe("workflow");
+    expect(body.generateTitle).toBe(true);
+    expect(body.saveAllThreadOperations).toBe(true);
+    expect(body.setUnreadState).toBe(true);
+    expect(body.createdSource).toBe("ai_module");
+    expect(body.debugOverrides).toEqual({ emitAgentSearchExtractedResults: true, cachedInferences: {}, annotationInferences: {}, emitInferences: false });
     const t = body.transcript;
     expect(t).toHaveLength(5);
     expect(t[0].type).toBe("config");

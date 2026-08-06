@@ -1090,8 +1090,10 @@ export async function getSpaces({ token, userId, spaceId, clientVersion }) {
   return res.json();
 }
 
-// POST createSpace with 429 exponential-backoff retry.
-export async function createSpace({ token, userId, spaceId, clientVersion, body, maxRetries = 4, baseMs = 1000 }) {
+// POST createSpace with 429 exponential-backoff retry. Default maxRetries=3
+// caps total sleep at 7s (1+2+4) so rotation stays well under the Workers
+// wall-clock limit even when preceded by an inference call.
+export async function createSpace({ token, userId, spaceId, clientVersion, body, maxRetries = 3, baseMs = 1000 }) {
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const res = await fetch(`${NOTION_BASE}/createSpace`, {
@@ -1578,10 +1580,9 @@ async function runTurn({ env, messages, message, write }) {
       return;
     }
     const ps = new PatchStream();
-    let rotated = false;
     for await (const line of ndjsonLines(res.body)) {
       for (const ev of ps.feedLine(line)) await write(ev.event, ev.data);
-      if (ps.isUnavailable) { rotated = true; break; }
+      if (ps.isUnavailable) break;
     }
     if (ps.isUnavailable && attempt < MAX_ROTATION) {
       try {
@@ -1624,7 +1625,9 @@ async function bootstrapActiveSpace({ env, kv }) {
 - [ ] **Step 4: Run the test to verify it PASSES**
 
 Run: `npm test -- test/worker.test.mjs`
-Expected: 9 passed.
+Expected: 12 passed.
+
+> **Reviewer follow-up (added coverage):** `notionMock` grew options `alwaysUnavailable` and `inferenceStatus` (non-2xx). Added tests: `GET /api/chat → 404` (non-POST on the correct path); `returns event: error when credit is exhausted on every workspace` (alwaysUnavailable, asserts `inferenceCalls===2` + `event: error` + no `done`); `returns event: error (and does not crash) when Notion returns non-2xx` (inferenceStatus:401, asserts SSE opens 200, body has `event: error` + `401`, no `done`). The rotation test now also asserts `lastBody().spaceId` equals the new space. `test/transcript.test.mjs` now asserts `generateTitle`/`saveAllThreadOperations`/`setUnreadState`/`createdSource`/`debugOverrides`. Total suite: 7 files / 49 tests.
 
 - [ ] **Step 5: Run the FULL suite to verify nothing regressed**
 

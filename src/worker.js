@@ -79,10 +79,9 @@ async function runTurn({ env, messages, message, write }) {
       return;
     }
     const ps = new PatchStream();
-    let rotated = false;
     for await (const line of ndjsonLines(res.body)) {
       for (const ev of ps.feedLine(line)) await write(ev.event, ev.data);
-      if (ps.isUnavailable) { rotated = true; break; }
+      if (ps.isUnavailable) break;
     }
     if (ps.isUnavailable && attempt < MAX_ROTATION) {
       try {

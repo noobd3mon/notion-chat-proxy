@@ -24,7 +24,10 @@ async function postChat(body, headers = {}) {
 }
 
 // notionMock returns helpers to inspect the last inference request body.
-function notionMock({ firstUnavailable = false }) {
+// Options: firstUnavailable (1st call unavailable, rest hello),
+//          alwaysUnavailable (every call unavailable), inferenceStatus (return a
+//          non-2xx empty body for runInferenceTranscript to simulate auth/expiry).
+function notionMock({ firstUnavailable = false, alwaysUnavailable = false, inferenceStatus = 0 } = {}) {
   let inferenceCalls = 0;
   let lastBody = null;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -32,6 +35,8 @@ function notionMock({ firstUnavailable = false }) {
     if (req.url.endsWith("/runInferenceTranscript")) {
       inferenceCalls++;
       lastBody = init?.body ? JSON.parse(init.body) : null;
+      if (inferenceStatus > 0) return new Response("", { status: inferenceStatus });
+      if (alwaysUnavailable) return new Response(unavailableNdjson, { headers: { "content-type": "application/x-ndjson" } });
       if (firstUnavailable && inferenceCalls === 1) {
         return new Response(unavailableNdjson, { headers: { "content-type": "application/x-ndjson" } });
       }
@@ -74,6 +79,10 @@ describe("POST /api/chat auth + validation", () => {
   });
   it("rejects non-POST / unknown path with 404", async () => {
     const res = await worker.fetch(new Request("https://worker.test/other"), env, createExecutionContext());
+    expect(res.status).toBe(404);
+  });
+  it("rejects GET /api/chat with 404 (non-POST on the correct path)", async () => {
+    const res = await worker.fetch(new Request("https://worker.test/api/chat"), env, createExecutionContext());
     expect(res.status).toBe(404);
   });
 });
@@ -130,8 +139,31 @@ describe("POST /api/chat streaming", () => {
     expect(m.inferenceCalls()).toBe(2); // 1st unavailable, 2nd hello
     expect(text).toContain("event: done");
     expect(text).toContain("Hello, Ky!");
+    // the retry was built against the NEW active space
+    expect(m.lastBody().spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
     const active = JSON.parse(await env.STORE.get("state:activeSpace"));
     expect(active.spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
+  });
+
+  it("returns event: error when credit is exhausted on every workspace", async () => {
+    const m = notionMock({ alwaysUnavailable: true });
+    const { res, ctx } = await postChat({ conversationId: "c5", messages: [], message: "hello" });
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(m.inferenceCalls()).toBe(2); // 1st + 1 rotation retry, both unavailable
+    expect(text).toContain("event: error");
+    expect(text).not.toContain("event: done");
+  });
+
+  it("returns event: error (and does not crash) when Notion returns non-2xx (e.g. expired token)", async () => {
+    notionMock({ inferenceStatus: 401 });
+    const { res, ctx } = await postChat({ conversationId: "c6", messages: [], message: "hello" });
+    expect(res.status).toBe(200); // SSE stream still opens
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(text).toContain("event: error");
+    expect(text).toContain("401");
+    expect(text).not.toContain("event: done");
   });
 
   it("bootstraps the active space from getSpaces when none is stored", async () => {

@@ -56,8 +56,10 @@ export async function getSpaces({ token, userId, spaceId, clientVersion }) {
   return res.json();
 }
 
-// POST createSpace with 429 exponential-backoff retry.
-export async function createSpace({ token, userId, spaceId, clientVersion, body, maxRetries = 4, baseMs = 1000 }) {
+// POST createSpace with 429 exponential-backoff retry. Default maxRetries=3
+// caps total sleep at 7s (1+2+4) so rotation stays well under the Workers
+// wall-clock limit even when preceded by an inference call.
+export async function createSpace({ token, userId, spaceId, clientVersion, body, maxRetries = 3, baseMs = 1000 }) {
   let lastErr;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const res = await fetch(`${NOTION_BASE}/createSpace`, {
