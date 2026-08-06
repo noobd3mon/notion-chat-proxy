@@ -16,13 +16,23 @@ export function nid() {
 // make this "ask" mode vs the full_page_chat capture: searchScopes is
 // "ai-knowledge" (not "everything"), useReadOnlyMode is true, availableConnectors
 // is []. Do not trim flags — Notion may validate the shape.
+//
+// NOTE: enableWebResearch + internetAccess are flipped to TRUE here (vs the
+// original ask-mode capture which had both false). With only useWebSearch:true
+// the model did not actually perform a web search in our probe; turning these on
+// is what makes the agent run a `connections.web.search` tool call, whose
+// results (the pages it searched) we then emit to the client as `event:
+// sources` (see src/sources.js + src/sse.js). The model still decides WHEN to
+// search — a plain "hi" does not trigger one. Verified working: live-probe
+// 2026-08-05. Both are overridable per-deploy via ENABLE_WEB_RESEARCH /
+// ENABLE_INTERNET_ACCESS (see worker.js).
 export const DEFAULT_CONFIG = {
   type: "workflow", model: "fireworks-kimi-k3", isHipaa: false, isMobile: false,
   writerMode: false, searchScopes: [{ type: "ai-knowledge" }], useWebSearch: true,
   isCustomAgent: false, manageWorkers: false, modelFromUser: true, enableComputer: false,
-  internetAccess: false, enableQueryMail: false, reasoningEffort: "max",
+  internetAccess: true, enableQueryMail: false, reasoningEffort: "max",
   useReadOnlyMode: true, availableConnectors: [], enableAgentDiffs: true, enableScriptAgent: true,
-  enableWebResearch: false, isOnboardingAgent: false, enableCustomAgents: true,
+  enableWebResearch: true, isOnboardingAgent: false, enableCustomAgents: true,
   enableAgentSkillsV2: false, enableMarkdownVNext: false, enableQueryCalendar: false,
   isCustomAgentCreate: false, useCustomAgentDraft: false, enableAgentAskSurvey: true,
   enableCrdtOperations: false, enableScriptAgentGtm: false, isCustomAgentBuilder: false,
@@ -43,8 +53,11 @@ export const DEFAULT_CONFIG = {
   enableScriptAgentSearchConnectorsInCustomAgent: false,
 };
 
-export function buildConfig({ model = "fireworks-kimi-k3", reasoningEffort = "max" } = {}) {
-  return { ...DEFAULT_CONFIG, model, reasoningEffort };
+export function buildConfig({ model = "fireworks-kimi-k3", reasoningEffort = "max", enableWebResearch, internetAccess } = {}) {
+  const cfg = { ...DEFAULT_CONFIG, model, reasoningEffort };
+  if (enableWebResearch !== undefined) cfg.enableWebResearch = enableWebResearch;
+  if (internetAccess !== undefined) cfg.internetAccess = internetAccess;
+  return cfg;
 }
 
 export function buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone = "Asia/Saigon", now, contextPageId }) {
@@ -74,24 +87,51 @@ export function buildAiEntry({ id, userId, text, now }) {
   return { id, type: "ai", userId, value: [[text]], createdAt: now };
 }
 
+// Build an attachment transcript entry from the pieces returned by uploadAttachment
+// (src/notion.js). The `stepMetadata` comes straight from getTasks' success result
+// (results[0].status.result.data.stepMetadata): for images it has width/height/
+// moderation/guardrail/estimatedTokens; for PDFs it has numPages instead and the
+// capture adds a top-level `base64EncodedFileUrl:""`. `attachmentSource` is set to
+// "user_upload" (matches the captured attachment entry). Image shape verified via
+// live-probe; PDF variant is best-effort from the earlier capture.
+export function buildAttachmentEntry({ fileUrl, fileName, contentType, stepMetadata = {} }) {
+  const entry = {
+    id: nid(),
+    type: "attachment",
+    fileUrl,
+    fileName,
+    contentType,
+    metadata: { ...stepMetadata, attachmentSource: "user_upload" },
+  };
+  if (contentType === "application/pdf") entry.base64EncodedFileUrl = "";
+  return entry;
+}
+
 // Build the full runInferenceTranscript body for one turn (full-replay).
 // `messages` = prior turns [{role:"user"|"ai", text}]; `message` = new user text.
+// `attachments` = pre-built attachment transcript entries (from uploadAttachment);
+// they are placed immediately before the new user message (a turn with a file is
+// [config, context, ...history, ...attachments, user]). `threadId` may be passed
+// in so the attachment upload (which needs a thread pointer) and this inference
+// call reference the SAME thread; if omitted a fresh one is generated.
 export function buildInferenceBody({
   spaceId, userId, spaceViewId, spaceName, userName, userEmail, timezone,
   messages = [], message, model, reasoningEffort, contextPageId,
+  threadId, attachments = [], enableWebResearch, internetAccess,
 }) {
   const now = new Date().toISOString();
   const transcript = [
-    { id: nid(), type: "config", value: buildConfig({ model, reasoningEffort }) },
+    { id: nid(), type: "config", value: buildConfig({ model, reasoningEffort, enableWebResearch, internetAccess }) },
     { id: nid(), type: "context", value: buildContext({ userId, spaceId, spaceViewId, spaceName, userName, userEmail, timezone, now, contextPageId }) },
   ];
   for (const m of messages) {
     if (m.role === "user") transcript.push(buildUserEntry({ id: nid(), userId, text: m.text, now }));
     else transcript.push(buildAiEntry({ id: nid(), userId, text: m.text, now }));
   }
+  for (const a of attachments) transcript.push(a);
   transcript.push(buildUserEntry({ id: nid(), userId, text: message, now }));
   return {
-    traceId: nid(), spaceId, threadId: nid(), createThread: true,
+    traceId: nid(), spaceId, threadId: threadId ?? nid(), createThread: true,
     generateTitle: true, saveAllThreadOperations: true, isPartialTranscript: false,
     asPatchResponse: true, patchResponseVersion: 2, transcript,
     threadParentPointer: { table: "space", id: spaceId, spaceId },

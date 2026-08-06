@@ -1,0 +1,9 @@
+{"type":"patch-start","data":{"s":[{"id":"w0","type":"agent-instruction-state","owner":"regular","root":{"type":"none"},"sources":[],"selectedSkillPageIds":[],"trackedInstructionTreePages":[]}]},"version":1}
+{"type":"patch","v":[{"o":"a","p":"/s/-","v":{"id":"w1","type":"agent-turn-full-record-map"}}]}
+{"type":"patch","v":[{"o":"a","p":"/s/-","v":{"id":"w2","type":"agent-tool-result","toolName":"callFunction","toolType":"callFunction","traceId":"t1","startedAt":1,"input":{"function":"connections.web.search","args":{"query":"openai news 2026"}},"state":"applied","result":{"output":"{\"results\":[[{\"url\":\"https://openai.com/news/\",\"title\":\"OpenAI News | OpenAI\",\"text\":\"All Company Research Product Safety Engineering Security Global Affairs.\"},{\"url\":\"https://www.theverge.com/openai\",\"title\":\"OpenAI news - The Verge\",\"text\":\"Latest OpenAI coverage and analysis.\"}]]}","headerLabel":[["Đã tìm kiếm trên web"]]},"finishedAt":2}}]}
+{"type":"patch","v":[{"o":"a","p":"/s/-","v":{"id":"w3","type":"title","value":"OpenAI news 2026","icon":"/icons/chat_lightgray.svg"}}]}
+{"type":"patch","v":[{"o":"a","p":"/s/-","v":{"id":"w4","type":"agent-inference","value":[{"type":"thinking","content":"Searching","modelProvider":"fireworks","notionModelName":"fireworks-kimi-k3","startedAt":3}],"traceId":"t1","startedAt":2,"previousAttemptValues":[]}}]}
+{"type":"patch","v":[{"o":"x","p":"/s/4/value/0/content","v":" the web"}]}
+{"type":"patch","v":[{"o":"a","p":"/s/4/value/-","v":{"type":"text","content":"Here is the news: "}}]}
+{"type":"patch","v":[{"o":"x","p":"/s/4/value/1/content","v":"OpenAI released new models."}]}
+{"type":"patch","v":[{"o":"a","p":"/s/4/finishedAt","v":4}]}

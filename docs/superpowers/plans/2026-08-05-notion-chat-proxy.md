@@ -1782,3 +1782,33 @@ No issues found. Plan is implementable as written.
 **Files touched:** `src/notion.js` (+`getAvailableModels`), `src/models.js` (new — transform/validate/cache), `src/worker.js` (+`/api/models` route, `handleModels`, per-request `model` validation, resolve `activeSpace` in handler), `test/fixtures/getAvailableModels.json` (new — 3 models: kimi-k3 + oatmeal-cookie enabled, acai-budino-high disabled), `test/models.test.mjs` (new — transform/validate unit tests), `test/worker.test.mjs` (+`GET /api/models` 200/401/502, +per-request model valid/disabled/unknown/default/skip-when-default; `notionMock` +`modelsStatus` + `getAvailableModels` branch; `beforeEach` `_resetCache()`). README + spec synced.
 
 **Test totals:** 8 files / 66 tests (was 7 / 49). `test/worker.test.mjs` 12 → 20.
+
+---
+
+## Addendum: File attachment + Web-search sources (added after model picker)
+
+**Features (user: "thêm support file, thêm nhả source ra api để web search nhả ra được sources các trang mà model search"):** (1) `multipart/form-data` `/api/chat` đính kèm file; (2) emit `event: sources` cho các trang model đã web search. Cả 2 đã **live-verified bằng token thật** (probe `_research/probe-shapes.mjs` + verify `_research/verify.mjs` — gitignored).
+
+### Shape discovery (probe-driven)
+Hai gap shape trong capture trước đó đã fill bằng live-probe:
+- `enqueueTask` → `{"taskId":"<uuid>:prod-space-usw2-0004"}` (top-level `taskId`).
+- `getTasks` success → `results[0].status.result.data.stepMetadata` (metadata đầy đủ).
+- Web-search sources: `agent-tool-result.result.output` = JSON string `{"results":[[{"url","title","text"}]]}` (verified: model search thật khi `enableWebResearch:true`+`internetAccess:true`).
+
+### Implementation
+- **`src/sources.js`** (new, pure): `extractSources(state)` — parse mọi `result.output` JSON, thu thập object có `url` http(s)+`title` (filter sạch fs.readFiles/notion.loadUser); snippet=text.slice(0,300); dedupe theo url.
+- **`src/sse.js`**: `PatchStream` thêm `_emittedSources` Set; `_emitPending` emit `event: sources` với source mới (diff theo url). Sources đến trước token.
+- **`src/transcript.js`**: `DEFAULT_CONFIG` flip `enableWebResearch`+`internetAccess`→true; `buildConfig` nhận override; `buildInferenceBody` nhận `threadId`+`attachments`+web flags, insert attachment trước user; `buildAttachmentEntry({fileUrl,fileName,contentType,stepMetadata})` → entry (PDF +`base64EncodedFileUrl:""`).
+- **`src/notion.js`**: `getUploadFileUrl` → `uploadToS3` (FormData fields+file) → `enqueueProcessAttachment` → `getTask` poll → `uploadAttachment` orchestrator (trả `{fileUrl,fileName,contentType,stepMetadata}`).
+- **`src/worker.js`**: detect `multipart/form-data`→parse `json`+`file`(s); resolve activeSpace→validate model→upload files (1 threadId chia sẻ cho upload+inference, lỗi→502 sạch)→`streamChat`/`runTurn` thread `attachments`+`threadId`+web flags. Web flags từ `ENABLE_WEB_RESEARCH`/`ENABLE_INTERNET_ACCESS` (default true).
+- **`server.js`**: +env defaults cho 2 web flags.
+
+### Tests (100/100 green, 66→100)
+- `test/sources.test.mjs` (new, 11): extractSources (websearch fixture 2 sources, hello fixture 0 false-positive, non-http filter, dedupe, flat results, non-JSON, snippet 300, omit snippet) + PatchStream emission (sources event, dedupe cross-snapshot, hello no sources).
+- `test/worker.test.mjs` (20→31): multipart file (attachment entry+threadId share, multi-file, history+attachments, S3 fail→502, getTasks error→502, no-file=json path, missing json→400), websearch (sources event+order, config flags).
+- `test/transcript.test.mjs` (13→21): buildConfig web-flag default+override, buildInferenceBody threadId+attachments+web flags, buildAttachmentEntry image/PDF/empty.
+- Fixtures: `getUploadFileUrl.json`, `getTasks.json`, `runInference-websearch.ndjson` (9-line stream: snapshot→web tool-result(2 sources)→title→inference thinking+text→finishedAt). `notionMock` +handlers cho 4 URL file-flow + S3 + `websearch`/`s3Fail`/`taskError` options + `lastUploadPointer()` capture.
+
+### Live verification
+- **File**: multipart PNG 8x8 → `event: done` + answer (model báo ảnh không qua moderation — đúng với ảnh synthetic; **flow upload→attachment→runInference chạy đúng end-to-end**).
+- **Sources**: JSON search query → `event: sources` thật (`{"sources":[{"url":"https://openai.com/news/","title":"OpenAI News | OpenAI","snippet":"..."}]}`) → `event: done`.

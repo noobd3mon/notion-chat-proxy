@@ -15,6 +15,7 @@
 // observed responses, so the path keys are stable).
 
 import { applyOp, extractAnswer } from "./patch.js";
+import { extractSources } from "./sources.js";
 
 export function sse(event, data) {
   const payload = typeof data === "string" ? data : JSON.stringify(data);
@@ -30,6 +31,7 @@ export class PatchStream {
     this._unavailable = false;
     this._finished = false;
     this._emitted = new Map(); // "/s/N/value/M/content" -> chars already streamed
+    this._emittedSources = new Set(); // source urls already emitted as `sources`
   }
   // Feed one NDJSON line. Returns events [{event, data}] produced by it.
   feedLine(line) {
@@ -54,7 +56,8 @@ export class PatchStream {
     applyOp(this.state, op);
   }
   // Stream any thinking/text content that grew since the last emit (initial
-  // content from a snapshot or an `a` op, plus `x`-op appends).
+  // content from a snapshot or an `a` op, plus `x`-op appends), AND any web-search
+  // sources that newly appeared (emitted once per url as an `event: sources`).
   _emitPending() {
     const events = [];
     for (const [n, e] of (this.state.s ?? []).entries()) {
@@ -70,6 +73,14 @@ export class PatchStream {
         }
       }
     }
+    // Web-search sources: a tool-result with result.output = {"results":[[{url,title}]]}
+    // appears mid-turn (before the answer). Emit new sources as they arrive so the
+    // frontend can render source links while the answer streams in.
+    const fresh = [];
+    for (const s of extractSources(this.state)) {
+      if (!this._emittedSources.has(s.url)) { this._emittedSources.add(s.url); fresh.push(s); }
+    }
+    if (fresh.length) events.push({ event: "sources", data: { sources: fresh } });
     return events;
   }
   _refreshFlags() {

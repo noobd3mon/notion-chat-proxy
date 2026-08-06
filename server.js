@@ -36,6 +36,10 @@ function makeEnv() {
     NOTION_USER_EMAIL: process.env.NOTION_USER_EMAIL || "",
     NOTION_TIMEZONE: process.env.NOTION_TIMEZONE || "Asia/Saigon",
     NOTION_SPACE_ID: process.env.NOTION_SPACE_ID || "",
+    // Web search (drives the `event: sources` SSE feature). Default on; set either
+    // to "false" on Railway to disable web search.
+    ENABLE_WEB_RESEARCH: process.env.ENABLE_WEB_RESEARCH ?? "true",
+    ENABLE_INTERNET_ACCESS: process.env.ENABLE_INTERNET_ACCESS ?? "true",
   };
 }
 

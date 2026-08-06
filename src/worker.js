@@ -1,6 +1,6 @@
 import { sse, PatchStream } from "./sse.js";
-import { buildInferenceBody, findNewSpace, findSpaceById } from "./transcript.js";
-import { callRunInference, ndjsonLines, getSpaces } from "./notion.js";
+import { buildInferenceBody, buildAttachmentEntry, findNewSpace, findSpaceById, nid } from "./transcript.js";
+import { callRunInference, ndjsonLines, getSpaces, uploadAttachment } from "./notion.js";
 import { getActiveSpace, setActiveSpace } from "./store.js";
 import { rotateWorkspace } from "./rotate.js";
 import { ensureModelsList, validateModel } from "./models.js";
@@ -21,10 +21,26 @@ export default {
     const auth = req.headers.get("authorization") || "";
     const key = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!key || key !== env.API_KEY) return json({ error: "unauthorized" }, 401);
-    // Parse body. The Worker is stateless for the transcript: the website sends the
-    // full message history (`messages`) each turn; the Worker stores no chat history.
+    // Parse body. Supports two content types:
+    //   - application/json: { conversationId, messages, message, model?, contextPageId? }
+    //   - multipart/form-data: a `json` field (stringified body as above) + one or
+    //     more `file` parts (Blob) to attach to this turn. The Worker relays the
+    //     file bytes to Notion's attachment upload flow (getUploadFileUrl -> S3 ->
+    //     enqueueTask -> getTasks); it does NOT store the file in KV. The uploaded
+    //     attachment becomes a transcript entry placed before the new user message.
+    const ct = req.headers.get("content-type") || "";
     let body;
-    try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+    let files = [];
+    if (ct.includes("multipart/form-data")) {
+      let form;
+      try { form = await req.formData(); } catch { return json({ error: "invalid multipart" }, 400); }
+      const jsonStr = form.get("json");
+      if (typeof jsonStr !== "string") return json({ error: "multipart requires a 'json' field" }, 400);
+      try { body = JSON.parse(jsonStr); } catch { return json({ error: "invalid json in 'json' field" }, 400); }
+      files = form.getAll("file");
+    } else {
+      try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+    }
     const { conversationId, message } = body || {};
     const messages = Array.isArray(body?.messages) ? body.messages : null;
     if (typeof message !== "string" || messages === null) {
@@ -52,7 +68,36 @@ export default {
         // model and let Notion reject it if it's invalid.
       }
     }
-    return streamChat({ env, ctx, conversationId, messages, message, model, contextPageId: body.contextPageId, activeSpace });
+    // Upload attached files (if any) BEFORE opening the SSE stream, so an upload
+    // failure returns a clean JSON error instead of a broken stream. All files in
+    // one request share ONE threadId, which is also used for the inference call so
+    // the attachments belong to the thread being created.
+    let attachments = [];
+    let threadId = null;
+    if (files.length) {
+      threadId = nid();
+      for (const f of files) {
+        if (!(f instanceof Blob)) continue;
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        if (!bytes.length) continue;
+        const name = typeof f.name === "string" && f.name ? f.name : `upload-${nid()}`;
+        const contentType = f.type || "application/octet-stream";
+        try {
+          const got = await uploadAttachment({
+            token: env.NOTION_TOKEN_V2, userId: activeSpace.userId, spaceId: activeSpace.spaceId,
+            clientVersion: env.NOTION_CLIENT_VERSION, threadId, name, contentType, bytes,
+          });
+          attachments.push(buildAttachmentEntry(got));
+        } catch (e) {
+          return json({ error: `file upload failed: ${e.message}` }, 502);
+        }
+      }
+    }
+    // Web-search enablement is per-deploy (default on). ENABLE_WEB_RESEARCH /
+    // ENABLE_INTERNET_ACCESS = "false" to disable web search (and thus sources).
+    const enableWebResearch = env.ENABLE_WEB_RESEARCH !== "false";
+    const internetAccess = env.ENABLE_INTERNET_ACCESS !== "false";
+    return streamChat({ env, ctx, conversationId, messages, message, model, contextPageId: body.contextPageId, activeSpace, attachments, threadId, enableWebResearch, internetAccess });
   },
 };
 
@@ -80,14 +125,14 @@ function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
-async function streamChat({ env, ctx, conversationId, messages, message, model, contextPageId, activeSpace }) {
+async function streamChat({ env, ctx, conversationId, messages, message, model, contextPageId, activeSpace, attachments, threadId, enableWebResearch, internetAccess }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
   const write = async (event, data) => { await writer.write(enc.encode(sse(event, data))); };
   const work = (async () => {
     try {
-      await runTurn({ env, kv: env.STORE, activeSpace, messages, message, model, contextPageId, write });
+      await runTurn({ env, kv: env.STORE, activeSpace, messages, message, model, contextPageId, attachments, threadId, enableWebResearch, internetAccess, write });
     } catch (e) {
       try { await write("error", { message: String(e?.message || e) }); } catch {}
     } finally {
@@ -103,13 +148,14 @@ async function streamChat({ env, ctx, conversationId, messages, message, model, 
   });
 }
 
-async function runTurn({ env, kv, activeSpace, messages, message, model, contextPageId, write }) {
+async function runTurn({ env, kv, activeSpace, messages, message, model, contextPageId, attachments, threadId, enableWebResearch, internetAccess, write }) {
   for (let attempt = 0; attempt <= MAX_ROTATION; attempt++) {
     const body = buildInferenceBody({
       spaceId: activeSpace.spaceId, userId: activeSpace.userId, spaceViewId: activeSpace.spaceViewId,
       spaceName: activeSpace.name, userName: env.NOTION_USER_NAME, userEmail: env.NOTION_USER_EMAIL,
       timezone: env.NOTION_TIMEZONE, messages, message,
       model, reasoningEffort: env.REASONING_EFFORT, contextPageId,
+      attachments, threadId, enableWebResearch, internetAccess,
     });
     const res = await callRunInference({
       token: env.NOTION_TOKEN_V2, userId: activeSpace.userId, spaceId: activeSpace.spaceId,

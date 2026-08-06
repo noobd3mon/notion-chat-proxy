@@ -4,8 +4,11 @@ import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test"
 import worker from "../src/worker.js";
 import helloNdjson from "./fixtures/runInference-hello.ndjson?raw";
 import unavailableNdjson from "./fixtures/runInference-unavailable.ndjson?raw";
+import websearchNdjson from "./fixtures/runInference-websearch.ndjson?raw";
 import getSpacesJson from "./fixtures/getSpaces.json";
 import getAvailableModelsJson from "./fixtures/getAvailableModels.json";
+import getUploadFileUrlJson from "./fixtures/getUploadFileUrl.json";
+import getTasksJson from "./fixtures/getTasks.json";
 import { _resetCache } from "../src/models.js";
 
 const ACTIVE = { spaceId: "S", spaceViewId: "SV", userId: "U", name: "Space" };
@@ -25,13 +28,34 @@ async function postChat(body, headers = {}) {
   return { res, ctx };
 }
 
+// Multipart /api/chat: a `json` form field (stringified body) + one or more `file`
+// parts. Returns {res, ctx} like postChat.
+async function postChatMultipart(jsonBody, files = [], headers = {}) {
+  const fd = new FormData();
+  fd.append("json", JSON.stringify(jsonBody));
+  for (const f of files) fd.append("file", f.blob, f.name);
+  const req = new Request("https://worker.test/api/chat", {
+    method: "POST",
+    headers: { authorization: "Bearer k", ...headers },
+    body: fd,
+  });
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(req, env, ctx);
+  return { res, ctx };
+}
+
 // notionMock returns helpers to inspect the last inference request body.
 // Options: firstUnavailable (1st call unavailable, rest hello),
 //          alwaysUnavailable (every call unavailable), inferenceStatus (return a
-//          non-2xx empty body for runInferenceTranscript to simulate auth/expiry).
-function notionMock({ firstUnavailable = false, alwaysUnavailable = false, inferenceStatus = 0, modelsStatus = 0 } = {}) {
+//          non-2xx empty body for runInferenceTranscript to simulate auth/expiry),
+//          modelsStatus (getAvailableModels returns non-2xx),
+//          websearch (runInference returns the web-search fixture with sources),
+//          s3Fail (the S3 multipart upload returns 400 -> 502),
+//          taskError (getTasks returns state:"error" -> 502).
+function notionMock({ firstUnavailable = false, alwaysUnavailable = false, inferenceStatus = 0, modelsStatus = 0, websearch = false, s3Fail = false, taskError = false } = {}) {
   let inferenceCalls = 0;
   let lastBody = null;
+  let lastUploadPointer = null;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const req = new Request(input, init);
     if (req.url.endsWith("/runInferenceTranscript")) {
@@ -42,6 +66,7 @@ function notionMock({ firstUnavailable = false, alwaysUnavailable = false, infer
       if (firstUnavailable && inferenceCalls === 1) {
         return new Response(unavailableNdjson, { headers: { "content-type": "application/x-ndjson" } });
       }
+      if (websearch) return new Response(websearchNdjson, { headers: { "content-type": "application/x-ndjson" } });
       return new Response(helloNdjson, { headers: { "content-type": "application/x-ndjson" } });
     }
     if (req.url.endsWith("/createSpace")) return new Response("{}", { headers: { "content-type": "application/json" } });
@@ -50,9 +75,26 @@ function notionMock({ firstUnavailable = false, alwaysUnavailable = false, infer
       if (modelsStatus > 0) return new Response("err", { status: modelsStatus });
       return new Response(JSON.stringify(getAvailableModelsJson), { headers: { "content-type": "application/json" } });
     }
+    if (req.url.endsWith("/getUploadFileUrlForAssistantChatTranscriptUpload")) {
+      const upBody = init?.body ? JSON.parse(init.body) : null;
+      lastUploadPointer = upBody?.assistantChatTranscriptSessionPointer?.id ?? null;
+      return new Response(JSON.stringify(getUploadFileUrlJson), { headers: { "content-type": "application/json" } });
+    }
+    if (req.url.endsWith("/enqueueTask")) {
+      return new Response(JSON.stringify({ taskId: "task-1:prod-space-usw2-0004" }), { headers: { "content-type": "application/json" } });
+    }
+    if (req.url.endsWith("/getTasks")) {
+      if (taskError) return new Response(JSON.stringify({ results: [{ id: "task-1", state: "error", status: { result: { type: "error", message: "bad file" } } }] }), { headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify(getTasksJson), { headers: { "content-type": "application/json" } });
+    }
+    // S3 multipart upload (non-notion host). 204 on success.
+    if (req.url.includes("amazonaws.com")) {
+      if (s3Fail) return new Response("bad", { status: 400 });
+      return new Response("", { status: 204 });
+    }
     throw new Error("unexpected " + req.url);
   });
-  return { inferenceCalls: () => inferenceCalls, lastBody: () => lastBody };
+  return { inferenceCalls: () => inferenceCalls, lastBody: () => lastBody, lastUploadPointer: () => lastUploadPointer };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -272,5 +314,136 @@ describe("POST /api/chat contextPageId (optional context_page_id)", () => {
     await waitOnExecutionContext(ctx);
     const ctxEntry = m.lastBody().transcript.find((e) => e.type === "context");
     expect(ctxEntry.value).not.toHaveProperty("context_page_id");
+  });
+});
+
+describe("POST /api/chat file attachment (multipart/form-data)", () => {
+  it("uploads a file and inserts an attachment entry before the user message, sharing one threadId", async () => {
+    const m = notionMock({});
+    const png = new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" });
+    const { res, ctx } = await postChatMultipart(
+      { conversationId: "f1", messages: [], message: "describe this image" },
+      [{ blob: png, name: "test.png" }],
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(text).toContain("event: done");
+    const t = m.lastBody().transcript;
+    // config, context, attachment, user
+    expect(t).toHaveLength(4);
+    expect(t[2]).toMatchObject({ type: "attachment", fileUrl: "attachment:file-1:test.png", fileName: "test.png", contentType: "image/png" });
+    expect(t[2].metadata.attachmentSource).toBe("user_upload");
+    expect(t[2].metadata.width).toBe(1);
+    expect(t[2].metadata.estimatedTokens).toEqual({ openai: 100, anthropic: 0.1 });
+    expect(t[3]).toMatchObject({ type: "user", value: [["describe this image"]] });
+    // the same threadId was used for the upload session pointer AND the inference body
+    expect(m.lastUploadPointer()).toBe(m.lastBody().threadId);
+  });
+
+  it("places multiple attachments before the user message, all on one threadId", async () => {
+    const m = notionMock({});
+    const a = new Blob([new Uint8Array([1])], { type: "image/png" });
+    const b = new Blob([new Uint8Array([2])], { type: "image/png" });
+    const { res, ctx } = await postChatMultipart(
+      { messages: [], message: "two images" },
+      [{ blob: a, name: "a.png" }, { blob: b, name: "b.png" }],
+    );
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    const t = m.lastBody().transcript;
+    // config, context, attachment(a), attachment(b), user
+    expect(t).toHaveLength(5);
+    expect(t[2].fileName).toBe("a.png");
+    expect(t[3].fileName).toBe("b.png");
+    expect(t[4]).toMatchObject({ type: "user", value: [["two images"]] });
+  });
+
+  it("replays history then attachments then the new user message (multi-turn + file)", async () => {
+    const m = notionMock({});
+    const png = new Blob([new Uint8Array([1])], { type: "image/png" });
+    const { res, ctx } = await postChatMultipart(
+      { messages: [{ role: "user", text: "hi" }, { role: "ai", text: "hello" }], message: "now this" },
+      [{ blob: png, name: "x.png" }],
+    );
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    const t = m.lastBody().transcript;
+    // config, context, user(hi), ai(hello), attachment, user(now this)
+    expect(t).toHaveLength(6);
+    expect(t[4]).toMatchObject({ type: "attachment" });
+    expect(t[5]).toMatchObject({ type: "user", value: [["now this"]] });
+  });
+
+  it("returns 502 (JSON, not a stream) when the S3 upload fails", async () => {
+    notionMock({ s3Fail: true });
+    const png = new Blob([new Uint8Array([1])], { type: "image/png" });
+    const { res, ctx } = await postChatMultipart({ messages: [], message: "x" }, [{ blob: png, name: "t.png" }]);
+    expect(res.status).toBe(502);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const data = await res.json();
+    expect(data.error).toContain("file upload failed");
+    await waitOnExecutionContext(ctx);
+  });
+
+  it("returns 502 when attachment processing (getTasks) reports an error", async () => {
+    notionMock({ taskError: true });
+    const png = new Blob([new Uint8Array([1])], { type: "image/png" });
+    const { res } = await postChatMultipart({ messages: [], message: "x" }, [{ blob: png, name: "t.png" }]);
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toContain("file upload failed");
+  });
+
+  it("multipart with a `json` field but no file behaves like the JSON path (no attachment)", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChatMultipart({ messages: [], message: "no file here" }, []);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(text).toContain("event: done");
+    const t = m.lastBody().transcript;
+    expect(t).toHaveLength(3); // config, context, user
+    expect(t.some((e) => e.type === "attachment")).toBe(false);
+  });
+
+  it("rejects multipart missing the `json` field with 400", async () => {
+    notionMock({});
+    const fd = new FormData();
+    fd.append("file", new Blob([new Uint8Array([1])], { type: "image/png" }), "t.png");
+    const req = new Request("https://worker.test/api/chat", { method: "POST", headers: { authorization: "Bearer k" }, body: fd });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(req, env, ctx);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("json");
+  });
+});
+
+describe("POST /api/chat web-search sources (event: sources)", () => {
+  it("emits an `event: sources` with the searched pages, then the answer, then done", async () => {
+    notionMock({ websearch: true });
+    const { res, ctx } = await postChat({ conversationId: "ws1", messages: [], message: "find openai news 2026" });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(text).toContain("event: sources");
+    expect(text).toContain("https://openai.com/news/");
+    expect(text).toContain("https://www.theverge.com/openai");
+    expect(text).toContain("event: thinking");
+    expect(text).toContain("event: token");
+    expect(text).toContain("Here is the news: OpenAI released new models.");
+    expect(text).toContain("event: done");
+    // sources come BEFORE the first token (search happens before the answer)
+    expect(text.indexOf("event: sources")).toBeLessThan(text.indexOf("event: token"));
+  });
+
+  it("emits web-search flags enabled in the Notion config", async () => {
+    const m = notionMock({ websearch: true });
+    const { res, ctx } = await postChat({ messages: [], message: "search the web" });
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    const cfg = m.lastBody().transcript[0].value;
+    expect(cfg.enableWebResearch).toBe(true);
+    expect(cfg.internetAccess).toBe(true);
+    expect(cfg.useWebSearch).toBe(true);
   });
 });

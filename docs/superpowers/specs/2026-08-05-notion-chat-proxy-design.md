@@ -169,3 +169,33 @@ test/              // vitest: patch, sse, transcript, notion, store, rotate, wor
 
 - UI chat, auth user cuối, rate limiting nâng cao, multi-user (hiện 1 token).
 - Dùng SDK chính thức (integration token) — chỉ tham khảo.
+
+---
+
+## Addendum: File attachment support (added after model picker)
+
+**Feature (user: "thêm support file"):** `POST /api/chat` chấp nhận `multipart/form-data` để đính kèm file (ảnh/PDF/CSV — giống "Add images, PDFs, or CSVs" của Notion). Field `json` (stringified body như request JSON) + 1+ part `file`. Worker relay bytes qua flow upload của Notion, KHÔNG lưu file trong KV (bytes chỉ tồn tại trong request memory của lượt đó). Shapes **đã verify bằng live-probe** (token thật, 2026-08-05).
+
+**Flow upload (verified):**
+1. `POST /api/v3/getUploadFileUrlForAssistantChatTranscriptUpload` — body `{name, contentType, assistantChatTranscriptSessionPointer:{spaceId, table:"thread", id:threadId}, contentLength, createThread:true}` → `{url:"attachment:<fileId>:<name>", signedGetUrl, signedUploadPostUrl, postHeaders:[], fields:{...11 trường S3...}, chatId}`. (POST, needs `x-notion-active-user-header`+`x-notion-space-id` — `notionHeaders` đã set.)
+2. S3 multipart POST đến `signedUploadPostUrl`: các `fields` trước (giữ thứ tự Notion trả về), part `file` CUỐI CÙNG (filename=name) → `204`. `postHeaders` là `[]` thực tế.
+3. `POST /api/v3/enqueueTask` — body `{task:{eventName:"processAgentAttachment", request:{url:fileUrl, spaceId, aiSessionPointer:{spaceId, table:"thread", id:threadId}, source:"user_upload", clientVersion}, cellRouting:{spaceIds:[spaceId]}}}` → `{"taskId":"<uuid>:prod-space-usw2-0004"}` (top-level `taskId` — đây là gap đã được probe fill).
+4. Poll `POST /api/v3/getTasks` — body `{taskIds:[taskId]}` → `{results:[{id, state, eventName, request, status:{result:{type, data}}}]}`. Success gần như tức thì (probe: poll đầu tiên đã `success`). Metadata ở `results[0].status.result.data.stepMetadata` (gap thứ 2 đã probe fill) — chứa `width`/`height`/`moderation`/`guardrail`/`fileSizeBytes`/`aiTraceId`/`estimatedTokens` (PDF: `numPages` thay width/height, không moderation).
+5. Build attachment entry (`buildAttachmentEntry` trong `transcript.js`): `{id:nid(), type:"attachment", fileUrl, fileName, contentType, metadata:{...stepMetadata, attachmentSource:"user_upload"}}`; PDF thêm top-level `base64EncodedFileUrl:""` (best-effort từ capture; image shape đã verify live, PDF shape từ capture trước đó).
+6. Transcript = `[config, context, ...history, ...attachments, user]` (attachment ngay trước user message mới). **Cùng `threadId`** dùng cho upload session pointer VÀ `runInferenceTranscript` (sinh 1 threadId cho cả request, truyền vào `buildInferenceBody`).
+
+**Xử lý lỗi:** lỗi upload/processing (S3 non-204, enqueueTask fail, getTasks `state:"error"`, poll timeout ~12s) → trả `502 {"error":"file upload failed: ..."}` (JSON error sạch, KHÔNG mở stream). Validation model vẫn chạy trước upload (nếu model sai → 400 trước khi upload). Multipart thiếu field `json` → `400`.
+
+## Addendum: Web-search sources (added with file support)
+
+**Feature (user: "nhả source ra api để web search nhả ra được sources các trang mà model search"):** bật web search thật + emit các trang model đã search ra SSE.
+
+**Bật web search:** `DEFAULT_CONFIG` flip `enableWebResearch` + `internetAccess` → `true` (capture ask-mode gốc có cả hai `false`; chỉ `useWebSearch:true` không đủ để model thực sự search trong probe). Model vẫn TỰ quyết định KHI nào search ("hi" bình thường không search). Per-deploy tắt bằng `ENABLE_WEB_RESEARCH=false` / `ENABLE_INTERNET_ACCESS=false` (worker.js). Đã verify live.
+
+**Shape sources (verified):** khi model search, stream append một `agent-tool-result` với `result.output` là **JSON string** `{"results":[[{"url":"https://...","title":"...","text":"..."}, ...]]}` (`results` là mảng, phần tử đầu là mảng các source; `headerLabel:"Đã tìm kiếm trên web"`). Lúc stream, state `s` có entry `type:"agent-tool-result"` này.
+
+**Extraction (`src/sources.js`, pure):** quét mọi entry có `result.output` (JSON string), parse, nếu có `results` thì recursion thu thập object có `url` http(s) + `title`. Filter sạch các tool output khác: `fs.readFiles` → `{files:[{path}]}` (không url/title); `notion.loadUser` → `{url:"user://..."}` (không http, không title). Snippet = `text` cắt 300 ký tự. Dedupe theo url.
+
+**Emission (`src/sse.js` `PatchStream._emitPending`):** sau mỗi patch/snapshot, `extractSources(state)` → diff với `_emittedSources` (Set url) → emit `event: sources` với `{sources:[...]}` (mới). Sources đến TRƯỚC token (search xảy ra trước answer). Dedupe qua snapshot lặp.
+
+**Files touched:** `src/sources.js` (new), `src/sse.js` (+emit sources), `src/transcript.js` (+`buildAttachmentEntry`, `buildInferenceBody` nhận `threadId`+`attachments`+web flags, `buildConfig` nhận override), `src/notion.js` (+`getUploadFileUrl`/`uploadToS3`/`enqueueProcessAttachment`/`getTask`/`uploadAttachment`), `src/worker.js` (parse multipart, upload orchestration, web-flag threading), `server.js` (+env defaults). Tests: `test/sources.test.mjs` (new, 11), `test/worker.test.mjs` (+file 7, +sources 2 = 31), `test/transcript.test.mjs` (+attachments/threadId/attachment entry/web flags = 21). Fixtures: `getUploadFileUrl.json`, `getTasks.json`, `runInference-websearch.ndjson`. **100/100 tests green; cả 2 feature live-verified** (file: upload→runInference→answer; sources: `event: sources` thật với openai.com/news/...).

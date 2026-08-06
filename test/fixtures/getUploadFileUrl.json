@@ -1,0 +1,20 @@
+{
+  "url": "attachment:file-1:test.png",
+  "signedGetUrl": "https://prod-files-secure.s3.us-west-2.amazonaws.com/get/test.png",
+  "signedUploadPostUrl": "https://prod-files-secure.s3.us-west-2.amazonaws.com/",
+  "postHeaders": [],
+  "fields": {
+    "Content-Type": "image/png",
+    "x-amz-storage-class": "INTELLIGENT_TIERING",
+    "tagging": "attachmentSource=user_upload",
+    "bucket": "prod-files-secure",
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": "AKIATEST/20260805/us-west-2/s3/aws4_request",
+    "X-Amz-Date": "20260805T000000Z",
+    "X-Amz-Security-Token": "test-security-token",
+    "key": "uploads/test.png",
+    "Policy": "test-policy-base64",
+    "X-Amz-Signature": "test-signature"
+  },
+  "chatId": "chat-1"
+}

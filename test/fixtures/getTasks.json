@@ -1,0 +1,39 @@
+{
+  "results": [
+    {
+      "id": "task-1:prod-space-usw2-0004",
+      "state": "success",
+      "eventName": "processAgentAttachment",
+      "request": {
+        "url": "attachment:file-1:test.png",
+        "spaceId": "S",
+        "aiSessionPointer": { "spaceId": "S", "table": "thread", "id": "thread-1" },
+        "source": "user_upload",
+        "clientVersion": "23.13.20260805.2047"
+      },
+      "status": {
+        "result": {
+          "type": "success",
+          "data": {
+            "fileSizeBytes": 3,
+            "aiTraceId": "ai-1",
+            "attachmentRisk": "skipped",
+            "contentType": "image/png",
+            "width": 1,
+            "height": 1,
+            "moderation": { "status": "passed" },
+            "stepMetadata": {
+              "width": 1,
+              "height": 1,
+              "moderation": { "status": "passed" },
+              "guardrail": { "attachmentRisk": "skipped", "inferenceId": "g-1" },
+              "fileSizeBytes": 3,
+              "aiTraceId": "ai-1",
+              "estimatedTokens": { "openai": 100, "anthropic": 0.1 }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

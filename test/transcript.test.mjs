@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, buildConfig, buildContext,
+  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, buildConfig, buildContext, buildAttachmentEntry,
 } from "../src/transcript.js";
 import getSpacesJson from "./fixtures/getSpaces.json";
 
@@ -25,6 +25,16 @@ describe("buildConfig", () => {
     expect(c.availableConnectors).toEqual([]);
     expect(c.useWebSearch).toBe(true);
     expect(c.enableComputer).toBe(false);
+  });
+  it("defaults enableWebResearch + internetAccess to true (web search on for sources)", () => {
+    const c = buildConfig({ model: "fireworks-kimi-k3" });
+    expect(c.enableWebResearch).toBe(true);
+    expect(c.internetAccess).toBe(true);
+  });
+  it("lets enableWebResearch/internetAccess be overridden (e.g. disable web search)", () => {
+    const c = buildConfig({ model: "fireworks-kimi-k3", enableWebResearch: false, internetAccess: false });
+    expect(c.enableWebResearch).toBe(false);
+    expect(c.internetAccess).toBe(false);
   });
 });
 
@@ -94,6 +104,62 @@ describe("buildInferenceBody", () => {
       contextPageId: "page-xyz",
     });
     expect(body.transcript[1].value.context_page_id).toBe("page-xyz");
+  });
+
+  it("uses the provided threadId (so an attachment upload shares the same thread)", () => {
+    const body = buildInferenceBody({
+      spaceId: "S", userId: "U", spaceViewId: "SV", spaceName: "Space",
+      userName: "Ky", userEmail: "ky@example.com", timezone: "Asia/Saigon",
+      messages: [], message: "hi", model: "fireworks-kimi-k3", reasoningEffort: "max",
+      threadId: "fixed-thread-id",
+    });
+    expect(body.threadId).toBe("fixed-thread-id");
+  });
+
+  it("places provided attachment entries right before the new user message", () => {
+    const att = buildAttachmentEntry({ fileUrl: "attachment:f:n.png", fileName: "n.png", contentType: "image/png", stepMetadata: { width: 1, height: 1 } });
+    const body = buildInferenceBody({
+      spaceId: "S", userId: "U", spaceViewId: "SV", spaceName: "Space",
+      userName: "Ky", userEmail: "ky@example.com", timezone: "Asia/Saigon",
+      messages: [{ role: "user", text: "hi" }], message: "see the image", model: "fireworks-kimi-k3", reasoningEffort: "max",
+      attachments: [att],
+    });
+    const t = body.transcript;
+    // config, context, user(hi), attachment, user(see the image)
+    expect(t).toHaveLength(5);
+    expect(t[3]).toMatchObject({ type: "attachment", fileUrl: "attachment:f:n.png" });
+    expect(t[4]).toMatchObject({ type: "user", value: [["see the image"]] });
+  });
+
+  it("forwards enableWebResearch/internetAccess into the config", () => {
+    const body = buildInferenceBody({
+      spaceId: "S", userId: "U", spaceViewId: "SV", spaceName: "Space",
+      userName: "Ky", userEmail: "ky@example.com", timezone: "Asia/Saigon",
+      messages: [], message: "hi", model: "fireworks-kimi-k3", reasoningEffort: "max",
+      enableWebResearch: false, internetAccess: false,
+    });
+    expect(body.transcript[0].value.enableWebResearch).toBe(false);
+    expect(body.transcript[0].value.internetAccess).toBe(false);
+  });
+});
+
+describe("buildAttachmentEntry", () => {
+  it("builds an image attachment entry with metadata + attachmentSource", () => {
+    const e = buildAttachmentEntry({ fileUrl: "attachment:f:n.png", fileName: "n.png", contentType: "image/png", stepMetadata: { width: 2, height: 3, estimatedTokens: { openai: 10 } } });
+    expect(e.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(e).toMatchObject({ type: "attachment", fileUrl: "attachment:f:n.png", fileName: "n.png", contentType: "image/png" });
+    expect(e.metadata).toMatchObject({ width: 2, height: 3, estimatedTokens: { openai: 10 }, attachmentSource: "user_upload" });
+    expect(e).not.toHaveProperty("base64EncodedFileUrl");
+  });
+  it("adds base64EncodedFileUrl for PDFs (best-effort per capture)", () => {
+    const e = buildAttachmentEntry({ fileUrl: "attachment:f:d.pdf", fileName: "d.pdf", contentType: "application/pdf", stepMetadata: { numPages: 5 } });
+    expect(e.base64EncodedFileUrl).toBe("");
+    expect(e.metadata.numPages).toBe(5);
+    expect(e.metadata.attachmentSource).toBe("user_upload");
+  });
+  it("uses an empty metadata + attachmentSource when stepMetadata is absent", () => {
+    const e = buildAttachmentEntry({ fileUrl: "attachment:f:x.bin", fileName: "x.bin", contentType: "application/octet-stream" });
+    expect(e.metadata).toEqual({ attachmentSource: "user_upload" });
   });
 });
 
