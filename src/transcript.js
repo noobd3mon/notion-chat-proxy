@@ -178,6 +178,25 @@ export function findNewSpace(json, currentSpaceId) {
   return { spaceId: pick.spaceId, spaceViewId: svBySpace[pick.spaceId] ?? null, name: pick.name, userId: uid };
 }
 
+// All real (getSpaces-visible) workspaces for the account, newest first, each
+// { spaceId, spaceViewId, name, userId, createdTime }. Used by rotation when
+// createSpace is DISABLED, to cycle through existing workspaces instead of
+// creating new ones. (API-created rotation spaces do NOT appear in getSpaces,
+// so the known-spaces KV store is still consulted first by the rotator.)
+export function listSpaces(json) {
+  const uid = Object.keys(json)[0];
+  const top = json[uid] || {};
+  const svBySpace = spaceViewBySpace(json);
+  const out = [];
+  for (const [id, sp] of Object.entries(top.space || {})) {
+    const v = sp?.value?.value;
+    if (!v) continue;
+    out.push({ spaceId: id, spaceViewId: svBySpace[id] ?? null, name: v.name, userId: uid, createdTime: v.created_time ?? 0 });
+  }
+  out.sort((a, b) => b.createdTime - a.createdTime);
+  return out;
+}
+
 // Exact space record by id, or null.
 export function findSpaceById(json, spaceId) {
   const uid = Object.keys(json)[0];

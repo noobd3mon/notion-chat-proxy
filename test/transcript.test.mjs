@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, buildConfig, buildContext, buildAttachmentEntry,
+  nid, buildInferenceBody, buildCreateSpaceBody, findNewSpace, findSpaceById, listSpaces, buildConfig, buildContext, buildAttachmentEntry,
 } from "../src/transcript.js";
 import getSpacesJson from "./fixtures/getSpaces.json";
 
@@ -194,5 +194,35 @@ describe("findNewSpace / findSpaceById", () => {
   });
   it("findSpaceById returns null for an unknown id", () => {
     expect(findSpaceById(getSpacesJson, "nope")).toBeNull();
+  });
+});
+
+describe("listSpaces", () => {
+  it("returns the single space from the fixture with spaceViewId + userId", () => {
+    const list = listSpaces(getSpacesJson);
+    expect(list).toEqual([
+      { spaceId: "0a06e656-4f5e-8172-a2f9-0003c6a35c94", spaceViewId: "3b36e656-4f5e-8057-8d81-0006184d07d5", name: "Ky Lo hieu’s Space", userId: "3b2d872b-594c-819e-bea4-000243baefda", createdTime: expect.any(Number) },
+    ]);
+  });
+  it("lists ALL real workspaces newest-first, mapping space_view -> spaceId", () => {
+    const json = {
+      U: {
+        space: {
+          OLD: { value: { value: { name: "old", created_time: 50 } } },
+          NEW: { value: { value: { name: "new", created_time: 500 } } },
+        },
+        space_view: {
+          SV_OLD: { value: { value: { space_id: "OLD" } } },
+          SV_NEW: { value: { value: { space_id: "NEW" } } },
+        },
+      },
+    };
+    const list = listSpaces(json);
+    expect(list.map((s) => s.spaceId)).toEqual(["NEW", "OLD"]); // newest first
+    expect(list).toContainEqual({ spaceId: "NEW", spaceViewId: "SV_NEW", name: "new", userId: "U", createdTime: 500 });
+    expect(list).toContainEqual({ spaceId: "OLD", spaceViewId: "SV_OLD", name: "old", userId: "U", createdTime: 50 });
+  });
+  it("returns [] when the account has no spaces", () => {
+    expect(listSpaces({ U: { space: {}, space_view: {} } })).toEqual([]);
   });
 });

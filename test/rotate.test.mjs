@@ -5,7 +5,11 @@ import { getKnownSpaces } from "../src/store.js";
 import getSpacesJson from "./fixtures/getSpaces.json";
 
 const current = { spaceId: "OLD", spaceViewId: "OSV", userId: "U", name: "old" };
-const ENV = { NOTION_TOKEN_V2: "T", NOTION_CLIENT_VERSION: "CV" };
+// createSpace opted IN (the rate-limited legacy path) — used by the createSpace
+// tests below. The prod DEFAULT is createSpace OFF (see ENV_NO_CREATE).
+const ENV = { NOTION_TOKEN_V2: "T", NOTION_CLIENT_VERSION: "CV", ENABLE_CREATE_SPACE: "true" };
+// createSpace DISABLED — the prod default. Rotation falls back to existing getSpaces workspaces.
+const ENV_NO_CREATE = { NOTION_TOKEN_V2: "T", NOTION_CLIENT_VERSION: "CV" };
 
 afterEach(() => vi.restoreAllMocks());
 beforeEach(async () => {
@@ -137,5 +141,87 @@ describe("rotateWorkspace — createSpace (no known space to reuse)", () => {
     await expect(rotateWorkspace({ env: ENV, kv: env.STORE, currentSpace: { ...current, spaceId: "NEW1" }, tried }))
       .rejects.toThrow("createSpace was already attempted");
     expect(createCalls).toBe(1);
+  });
+});
+
+describe("rotateWorkspace — getSpaces fallback (createSpace disabled, default)", () => {
+  // A getSpaces response with two real workspaces (S1 older, S2 newer), neither == current(OLD).
+  const multi = () => ({
+    U: {
+      space: {
+        S1: { value: { value: { name: "space-one", created_time: 100 } } },
+        S2: { value: { value: { name: "space-two", created_time: 200 } } },
+      },
+      space_view: {
+        SV1: { value: { value: { space_id: "S1" } } },
+        SV2: { value: { value: { space_id: "S2" } } },
+      },
+    },
+  });
+
+  it("also reuses a known workspace BEFORE falling back to getSpaces (no Notion call)", async () => {
+    await setKnown([{ spaceId: "K1", spaceViewId: "KSV1", name: "k1", userId: "U", createdAt: 100 }]);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("should not call Notion when a known space is reusable"); });
+    const rec = await rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set() });
+    expect(rec).toEqual({ spaceId: "K1", spaceViewId: "KSV1", name: "k1", userId: "U" });
+  });
+
+  it("rotates to a real existing workspace from getSpaces (no createSpace call)", async () => {
+    const calls = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const req = new Request(input);
+      calls.push(req.url);
+      if (req.url.endsWith("/getSpaces")) return new Response(JSON.stringify(multi()), { headers: { "content-type": "application/json" } });
+      throw new Error("unexpected (createSpace must stay disabled): " + req.url);
+    });
+    const rec = await rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set() });
+    // listSpaces is newest-first -> S2
+    expect(rec).toEqual({ spaceId: "S2", spaceViewId: "SV2", name: "space-two", userId: "U" });
+    expect(calls.some((u) => u.endsWith("/getSpaces"))).toBe(true);
+    expect(calls.some((u) => u.endsWith("/createSpace"))).toBe(false);
+    expect(JSON.parse(await env.STORE.get("state:activeSpace"))).toEqual(rec);
+  });
+
+  it("skips already-tried existing workspaces and cycles to the next", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const req = new Request(input);
+      if (req.url.endsWith("/getSpaces")) return new Response(JSON.stringify(multi()), { headers: { "content-type": "application/json" } });
+      throw new Error("unexpected: " + req.url);
+    });
+    // S2 already tried this turn -> must pick the other (S1)
+    const rec = await rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set([current.spaceId, "S2"]) });
+    expect(rec).toEqual({ spaceId: "S1", spaceViewId: "SV1", name: "space-one", userId: "U" });
+  });
+
+  it("errors cleanly when all existing workspaces are already tried (no createSpace)", async () => {
+    const calls = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const req = new Request(input);
+      calls.push(req.url);
+      if (req.url.endsWith("/getSpaces")) return new Response(JSON.stringify(multi()), { headers: { "content-type": "application/json" } });
+      throw new Error("unexpected: " + req.url);
+    });
+    await expect(rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set([current.spaceId, "S1", "S2"]) }))
+      .rejects.toThrow("all known + existing workspaces exhausted");
+    expect(calls.some((u) => u.endsWith("/createSpace"))).toBe(false);
+  });
+
+  it("errors cleanly when getSpaces lists only the current space", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const req = new Request(input);
+      if (req.url.endsWith("/getSpaces")) {
+        const single = { U: { space: { [current.spaceId]: { value: { value: { name: "only" } } } }, space_view: {} } };
+        return new Response(JSON.stringify(single), { headers: { "content-type": "application/json" } });
+      }
+      throw new Error("unexpected: " + req.url);
+    });
+    await expect(rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set() }))
+      .rejects.toThrow("all known + existing workspaces exhausted");
+  });
+
+  it("propagates getSpaces errors as a rotation failure", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("nope", { status: 500 }));
+    await expect(rotateWorkspace({ env: ENV_NO_CREATE, kv: env.STORE, currentSpace: current, tried: new Set() }))
+      .rejects.toThrow("getSpaces error");
   });
 });

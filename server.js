@@ -68,6 +68,11 @@ function makeEnv() {
     NOTION_USER_EMAIL: process.env.NOTION_USER_EMAIL || "",
     NOTION_TIMEZONE: process.env.NOTION_TIMEZONE || "Asia/Saigon",
     NOTION_SPACE_ID: process.env.NOTION_SPACE_ID || "",
+    // Workspace rotation on credit exhaustion: createSpace is HARD rate-limited by
+    // Notion (429 after a few calls), so it is OFF by default — rotation instead
+    // cycles the account's existing getSpaces-visible workspaces. Set "true" to opt
+    // back into creating new workspaces (the rate-limited last resort).
+    ENABLE_CREATE_SPACE: process.env.ENABLE_CREATE_SPACE || "false",
     // Web search (drives the `event: sources` SSE feature). Default on; set either
     // to "false" on Railway to disable web search.
     ENABLE_WEB_RESEARCH: process.env.ENABLE_WEB_RESEARCH ?? "true",
