@@ -13,3 +13,6 @@ docs
 vitest.config.mjs
 wrangler.toml
 wrangler.test.toml
+# Runtime state (file-backed KV) — must not be baked into the image; the container
+# creates it at runtime (ideally on a mounted volume).
+data

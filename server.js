@@ -2,10 +2,11 @@
 // Node HTTP server, so the same code deploys on Railway/Docker WITHOUT the
 // Cloudflare Workers platform. Provides the two Worker-only things the handler
 // needs:
-//   - env.STORE: an in-memory KV shim. Only `state:activeSpace` is stored, and it
-//     is re-derived from getSpaces on cold start if empty, so a container restart
-//     is fine (it just bootstraps again). Not shared across instances — for a
-//     single-replica Railway deployment that's OK.
+//   - env.STORE: a FILE-BACKED KV shim (see STATE_FILE below). Only
+//     `state:activeSpace` is stored, and it is persisted to disk so a container
+//     restart/redeploy keeps the active (possibly rotation-created) space. On the
+//     first request after a truly empty start it bootstraps from getSpaces.
+//     Not shared across instances — for a single-replica Railway deployment OK.
 //   - ctx.waitUntil: fire-and-forget. Node never cancels background work, and the
 //     SSE work is driven by us pumping the response body, so it completes.
 // All NOTION_*/API_KEY vars come from process.env (set them on Railway / docker
@@ -13,15 +14,46 @@
 // TransformStream, ReadableStream, Request/Response, TextDecoder) are globals in
 // Node 18+, so src/* runs unchanged.
 import http from "node:http";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { dirname } from "node:path";
 import worker from "./src/worker.js";
 
 const PORT = Number(process.env.PORT || 8080);
 
+// The Worker stores only `state:activeSpace` in env.STORE. On Cloudflare that's a
+// real (persistent) KV. Here (Node/Railway) we back the shim with a JSON FILE so the
+// active space survives container restarts/redeploys — which matters because spaces
+// created by the rotation flow (createSpace API) do NOT appear in getSpaces, so a
+// restart could not otherwise recover the rotated-to space (it would fall back to the
+// user's original, likely credit-exhausted, space). Point STATE_FILE at a Railway
+// persistent volume to keep it across restarts; otherwise it lives in the container
+// filesystem and is lost on redeploy.
+const STATE_FILE = process.env.STATE_FILE || "./data/active-space.json";
+
 const store = {
-  _m: new Map(),
-  async get(k) { return this._m.has(k) ? this._m.get(k) : null; },
-  async put(k, v) { this._m.set(k, v); },
-  async delete(k) { this._m.delete(k); },
+  _m: null,
+  _load() {
+    if (this._m !== null) return;
+    try {
+      this._m = existsSync(STATE_FILE)
+        ? new Map(Object.entries(JSON.parse(readFileSync(STATE_FILE, "utf8"))))
+        : new Map();
+    } catch (e) {
+      console.error("[store] load failed (starting empty):", e.message);
+      this._m = new Map();
+    }
+  },
+  _persist() {
+    try {
+      mkdirSync(dirname(STATE_FILE) || ".", { recursive: true });
+      writeFileSync(STATE_FILE, JSON.stringify(Object.fromEntries(this._m), null, 2));
+    } catch (e) {
+      console.error("[store] persist failed:", e.message);
+    }
+  },
+  async get(k) { this._load(); return this._m.has(k) ? this._m.get(k) : null; },
+  async put(k, v) { this._load(); this._m.set(k, v); this._persist(); },
+  async delete(k) { this._load(); this._m.delete(k); this._persist(); },
 };
 
 function makeEnv() {

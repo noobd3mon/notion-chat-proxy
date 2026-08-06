@@ -4,3 +4,5 @@ node_modules/
 dist/
 _research/
 .superpowers/
+# Runtime file-backed KV state (the active workspace id). Per-deployment; never commit.
+data/

@@ -49,8 +49,9 @@ docker push <your-dockerhub-user>/notion-chat-proxy:latest
    - `NOTION_CLIENT_VERSION` (default `23.13.20260805.2047`).
    - `NOTION_SPACE_ID` (optional — initial space; if omitted, the worker picks the newest from `getSpaces`).
    - `ENABLE_WEB_RESEARCH` / `ENABLE_INTERNET_ACCESS` (default `true` / `true`) — set either to `false` to disable web search (and thus the `event: sources` feature).
-3. Railway gives `PORT` automatically; the server listens on it. Expose the port (Railley does this for web services).
-4. Health check: `GET https://<your-app>.up.railway.app/health` → `ok`.
+3. **Persistent volume (important):** the Node server persists the active workspace id to a file so a restart/redeploy keeps the rotated-to workspace (spaces created by the rotation flow do NOT appear in `getSpaces`, so they can't be recovered otherwise). Add a Railway **Volume** mounted at `/data` and set `STATE_FILE=/data/active-space.json` (default is `./data/active-space.json` inside the ephemeral container filesystem — without a volume this is lost on every redeploy). The file is a JSON map keyed by `state:activeSpace`.
+4. Railway gives `PORT` automatically; the server listens on it. Expose the port (Railway does this for web services).
+5. Health check: `GET https://<your-app>.up.railway.app/health` → `ok`.
 
 ### Run locally with Node / Docker
 
@@ -63,9 +64,11 @@ docker run -p 8080:8080 -e API_KEY=k -e NOTION_TOKEN_V2=<token> \
   -e NOTION_USER_NAME=Ky -e NOTION_USER_EMAIL=you@example.com <your-dockerhub-user>/notion-chat-proxy:latest
 ```
 
-> The in-memory KV resets on restart. On the first request after a restart the worker re-derives the active space from `getSpaces`, so this is fine for a single replica. For multi-replica you'd want a shared store (out of scope here).
+> The active workspace id is persisted to `STATE_FILE` (default `./data/active-space.json`, a JSON map). On the first request after an empty start the worker bootstraps from `getSpaces`; afterwards the file holds the active (possibly rotation-created) space. **Mount a volume** (Railway Volume at `/data`, `STATE_FILE=/data/active-space.json`) to survive restarts/redeploys — otherwise a redeploy loses the rotated-to space and the worker falls back to your original space (which may be credit-exhausted, triggering a fresh rotation). For multi-replica you'd want a shared store (out of scope here).
 
-> Cloudflare Workers deploy is still available via `npm run deploy` (uses `wrangler.toml` + real Cloudflare KV). Both targets run the same `src/*` code.
+> **Rotation note:** spaces created by the `createSpace` API (planType `"team"`) do **not** appear in `getSpaces` for your user. So `rotateWorkspace` takes the new space id straight from the `createSpace` response (Notion camelCase `spaceId` / `spaceViewId`, with a uuid-scan fallback), and only falls back to `getSpaces` if the response carries no recognizable id. The active space is then persisted to the file above.
+
+> Cloudflare Workers deploy is still available via `npm run deploy` (uses `wrangler.toml` + real Cloudflare KV, which is already persistent — no STATE_FILE needed there). Both targets run the same `src/*` code.
 
 ## Consume the endpoint
 
