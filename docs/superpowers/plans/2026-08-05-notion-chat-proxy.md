@@ -1357,8 +1357,12 @@ async function postChat(body, headers = {}) {
   });
   const ctx = createExecutionContext();
   const res = await worker.fetch(req, env, ctx);
-  await waitOnExecutionContext(ctx);
-  return res;
+  // NOTE: do NOT await waitOnExecutionContext here. The SSE response is a
+  // TransformStream fed by a `ctx.waitUntil` task; the caller must read the body
+  // (`await res.text()`) to pump the stream and let the work finish BEFORE
+  // `waitOnExecutionContext`, otherwise the work deadlocks on backpressure and
+  // the test times out. Returns { res, ctx } so the caller can wait afterwards.
+  return { res, ctx };
 }
 
 // notionMock returns helpers to inspect the last inference request body.
@@ -1399,15 +1403,15 @@ describe("GET /health", () => {
 describe("POST /api/chat auth + validation", () => {
   it("rejects wrong bearer with 401", async () => {
     notionMock({});
-    const res = await postChat({ messages: [], message: "hi" }, { authorization: "Bearer wrong" });
+    const { res } = await postChat({ messages: [], message: "hi" }, { authorization: "Bearer wrong" });
     expect(res.status).toBe(401);
   });
   it("rejects missing message with 400", async () => {
-    const res = await postChat({ messages: [] });
+    const { res } = await postChat({ messages: [] });
     expect(res.status).toBe(400);
   });
   it("rejects a non-array messages with 400", async () => {
-    const res = await postChat({ messages: "hi", message: "x" });
+    const { res } = await postChat({ messages: "hi", message: "x" });
     expect(res.status).toBe(400);
   });
   it("rejects non-POST / unknown path with 404", async () => {
@@ -1419,10 +1423,11 @@ describe("POST /api/chat auth + validation", () => {
 describe("POST /api/chat streaming", () => {
   it("streams thinking + token deltas then done (stateless: stores NO transcript)", async () => {
     notionMock({});
-    const res = await postChat({ conversationId: "c1", messages: [], message: "hello" });
+    const { res, ctx } = await postChat({ conversationId: "c1", messages: [], message: "hello" });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
     const text = await res.text();
+    await waitOnExecutionContext(ctx);
     expect(text).toContain("event: thinking");
     expect(text).toContain("event: token");
     expect(text).toContain("event: done");
@@ -1433,7 +1438,7 @@ describe("POST /api/chat streaming", () => {
 
   it("replays the provided message history to Notion (multi-turn, full replay)", async () => {
     const m = notionMock({});
-    const res = await postChat({
+    const { res, ctx } = await postChat({
       conversationId: "c2",
       messages: [
         { role: "user", text: "remember PINEAPPLE" },
@@ -1442,6 +1447,8 @@ describe("POST /api/chat streaming", () => {
       message: "what did i say?",
     });
     expect(res.status).toBe(200);
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
     const body = m.lastBody();
     const t = body.transcript;
     // config + context + 2 prior + 1 new = 5
@@ -1453,13 +1460,15 @@ describe("POST /api/chat streaming", () => {
     expect(t[4]).toMatchObject({ type: "user", value: [["what did i say?"]] });
     expect(body.createThread).toBe(true);
     expect(body.isPartialTranscript).toBe(false);
+    expect(text).toContain("event: done");
     expect(await env.STORE.get("conv:c2")).toBeNull();
   });
 
   it("rotates on credit exhaustion then retries on the new space", async () => {
     const m = notionMock({ firstUnavailable: true });
-    const res = await postChat({ conversationId: "c3", messages: [], message: "hello" });
+    const { res, ctx } = await postChat({ conversationId: "c3", messages: [], message: "hello" });
     const text = await res.text();
+    await waitOnExecutionContext(ctx);
     expect(m.inferenceCalls()).toBe(2); // 1st unavailable, 2nd hello
     expect(text).toContain("event: done");
     expect(text).toContain("Hello, Ky!");
@@ -1470,8 +1479,9 @@ describe("POST /api/chat streaming", () => {
   it("bootstraps the active space from getSpaces when none is stored", async () => {
     await env.STORE.delete("state:activeSpace");
     notionMock({});
-    const res = await postChat({ conversationId: "c4", messages: [], message: "hello" });
+    const { res, ctx } = await postChat({ conversationId: "c4", messages: [], message: "hello" });
     const text = await res.text();
+    await waitOnExecutionContext(ctx);
     expect(text).toContain("event: done");
     const active = JSON.parse(await env.STORE.get("state:activeSpace"));
     expect(active.spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
