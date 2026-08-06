@@ -1,0 +1,47 @@
+{
+  "restrictedGeoPolicyApplied": false,
+  "restrictedAccessModelsInPickerConfig": [],
+  "models": [
+    {
+      "model": "fireworks-kimi-k3",
+      "modelMessage": "Kimi K3",
+      "modelFamily": "mystery",
+      "modelProvider": "kimi",
+      "displayGroup": "intelligent",
+      "modelConfiguration": {
+        "supportedReasoningEfforts": ["low", "high", "max"],
+        "defaultReasoningEffort": "max"
+      },
+      "isDisabled": false,
+      "modelCardAttributes": { "speed": 3, "intelligence": 5, "cost": 5 }
+    },
+    {
+      "model": "oatmeal-cookie",
+      "modelMessage": "GPT-5.2",
+      "modelFamily": "openai",
+      "modelProvider": "openai",
+      "displayGroup": "fast",
+      "modelConfiguration": {
+        "supportedReasoningEfforts": ["medium", "high"],
+        "defaultReasoningEffort": "medium"
+      },
+      "isDisabled": false,
+      "modelCardAttributes": { "speed": 4, "intelligence": 4, "cost": 3 }
+    },
+    {
+      "model": "acai-budino-high",
+      "modelMessage": "Fable 5",
+      "modelFamily": "anthropic",
+      "modelProvider": "anthropic",
+      "displayGroup": "intelligent",
+      "modelConfiguration": {
+        "supportedReasoningEfforts": ["low", "medium", "high", "max"],
+        "defaultReasoningEffort": "high"
+      },
+      "isDisabled": true,
+      "disabledReason": "business_or_enterprise_plan_required",
+      "restrictedAccessModelCodename": "acai-budino",
+      "modelCardAttributes": { "speed": 2, "intelligence": 5, "cost": 5 }
+    }
+  ]
+}

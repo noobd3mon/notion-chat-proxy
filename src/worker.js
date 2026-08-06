@@ -3,6 +3,7 @@ import { buildInferenceBody, findNewSpace, findSpaceById } from "./transcript.js
 import { callRunInference, ndjsonLines, getSpaces } from "./notion.js";
 import { getActiveSpace, setActiveSpace } from "./store.js";
 import { rotateWorkspace } from "./rotate.js";
+import { ensureModelsList, validateModel } from "./models.js";
 
 const MAX_ROTATION = 1;
 
@@ -10,7 +11,10 @@ export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
     if (url.pathname === "/health") return new Response("ok", { status: 200 });
-    if (req.method !== "POST" || url.pathname !== "/api/chat") {
+    if (url.pathname === "/api/models" && req.method === "GET") {
+      return handleModels(req, env);
+    }
+    if (url.pathname !== "/api/chat" || req.method !== "POST") {
       return json({ error: "not found" }, 404);
     }
     // Auth
@@ -26,22 +30,64 @@ export default {
     if (typeof message !== "string" || messages === null) {
       return json({ error: "message (string) and messages (array) required" }, 400);
     }
-    return streamChat({ env, ctx, conversationId, messages, message });
+    // Optional per-request model. Default to the configured NOTION_MODEL. The
+    // caller may pass `model` (a Notion model codename from GET /api/models).
+    const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : null;
+    const model = requestedModel ?? env.NOTION_MODEL;
+    // Resolve the active space ONCE (1 KV read) and reuse for validation + the
+    // streaming turn (previously runTurn resolved it itself — net KV reads are
+    // unchanged). Validate the model only when the caller explicitly chose a model
+    // different from the configured default, so the common path stays free of any
+    // extra Notion/KV work.
+    const kv = env.STORE;
+    let activeSpace = await getActiveSpace(kv);
+    if (!activeSpace) activeSpace = await bootstrapActiveSpace({ env, kv });
+    if (requestedModel && requestedModel !== env.NOTION_MODEL) {
+      try {
+        const list = await ensureModelsList({ env, activeSpace });
+        const v = validateModel(requestedModel, list);
+        if (!v.ok) return json({ error: `invalid model: ${v.reason}` }, 400);
+      } catch {
+        // Fail open: the list couldn't be loaded. Proceed with the requested
+        // model and let Notion reject it if it's invalid.
+      }
+    }
+    return streamChat({ env, ctx, conversationId, messages, message, model, activeSpace });
   },
 };
+
+// GET /api/models — proxy Notion's model picker list (transformed) so the
+// website can render a model selector. Same Bearer auth as /api/chat. Uses the
+// in-memory cache (src/models.js) so repeated calls within an isolate + TTL are
+// free of Notion calls.
+async function handleModels(req, env) {
+  const auth = req.headers.get("authorization") || "";
+  const key = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!key || key !== env.API_KEY) return json({ error: "unauthorized" }, 401);
+  const kv = env.STORE;
+  let activeSpace = await getActiveSpace(kv);
+  if (!activeSpace) activeSpace = await bootstrapActiveSpace({ env, kv });
+  let models;
+  try {
+    models = await ensureModelsList({ env, activeSpace });
+  } catch (e) {
+    return json({ error: `getAvailableModels failed: ${e.message}` }, 502);
+  }
+  return json({ models }, 200);
+}
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 }
 
-async function streamChat({ env, ctx, conversationId, messages, message }) {
+async function streamChat({ env, ctx, conversationId, messages, message, model, activeSpace }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const enc = new TextEncoder();
   const write = async (event, data) => { await writer.write(enc.encode(sse(event, data))); };
   const work = (async () => {
     try {
-      await runTurn({ env, messages, message, write });
+      await runTurn({ env, kv: env.STORE, activeSpace, messages, message, model, write });
     } catch (e) {
       try { await write("error", { message: String(e?.message || e) }); } catch {}
     } finally {
@@ -57,17 +103,13 @@ async function streamChat({ env, ctx, conversationId, messages, message }) {
   });
 }
 
-async function runTurn({ env, messages, message, write }) {
-  const kv = env.STORE;
-  let activeSpace = await getActiveSpace(kv);
-  if (!activeSpace) activeSpace = await bootstrapActiveSpace({ env, kv });
-
+async function runTurn({ env, kv, activeSpace, messages, message, model, write }) {
   for (let attempt = 0; attempt <= MAX_ROTATION; attempt++) {
     const body = buildInferenceBody({
       spaceId: activeSpace.spaceId, userId: activeSpace.userId, spaceViewId: activeSpace.spaceViewId,
       spaceName: activeSpace.name, userName: env.NOTION_USER_NAME, userEmail: env.NOTION_USER_EMAIL,
       timezone: env.NOTION_TIMEZONE, messages, message,
-      model: env.NOTION_MODEL, reasoningEffort: env.REASONING_EFFORT,
+      model, reasoningEffort: env.REASONING_EFFORT,
     });
     const res = await callRunInference({
       token: env.NOTION_TOKEN_V2, userId: activeSpace.userId, spaceId: activeSpace.spaceId,

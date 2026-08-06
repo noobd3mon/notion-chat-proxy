@@ -38,11 +38,13 @@ Content-Type: application/json
     { "role": "user", "text": "hi" },
     { "role": "ai", "text": "hello!" }
   ],
-  "message": "how are you"
+  "message": "how are you",
+  "model": "fireworks-kimi-k3"
 }
 ```
 - `messages` = the prior turns (the website keeps them to render the chat). Send `[]` on the first turn.
 - `message` = the new user text for this turn.
+- `model` (optional) = a Notion model codename from `GET /api/models`. Defaults to `NOTION_MODEL` (`fireworks-kimi-k3`). When set to something other than the default, the Worker validates it against the available list and rejects disabled/unknown models with `400`.
 - The Worker stores **no** chat history — it just replays `messages` + `message` to Notion and streams the answer back.
 
 Response is `text/event-stream`:
@@ -78,12 +80,42 @@ async function send(message) {
 }
 ```
 
+## List available models (model picker)
+
+```
+GET https://<your-worker>.workers.dev/api/models
+Authorization: Bearer <API_KEY>
+```
+
+Returns `{ "models": [...] }` — the account's Notion model picker list, transformed to a clean shape:
+
+```json
+{
+  "models": [
+    {
+      "id": "fireworks-kimi-k3",
+      "name": "Kimi K3",
+      "family": "mystery",
+      "provider": "kimi",
+      "displayGroup": "intelligent",
+      "disabled": false,
+      "disabledReason": null,
+      "supportedReasoningEfforts": ["low", "high", "max"],
+      "defaultReasoningEffort": "max"
+    }
+  ]
+}
+```
+
+Use `id` as the `model` field in `POST /api/chat`. The list is cached in-memory per isolate (~1h) so repeated calls within an isolate are free of Notion calls.
+
 ## How it works
 
 - `src/patch.js` — folds Notion's NDJSON JSON-Patch stream into state (handles `patch-start` AND `patch-sync` snapshots).
 - `src/sse.js` — turns patch `x` ops into `thinking`/`token` SSE deltas.
 - `src/transcript.js` — builds Notion request bodies (config/context/entries, createSpace, space discovery).
-- `src/notion.js` — HTTP client + line streamer.
+- `src/notion.js` — HTTP client + line streamer (runInferenceTranscript, getSpaces, createSpace, getAvailableModels).
+- `src/models.js` — getAvailableModels transform + per-request model validation + in-memory cache.
 - `src/store.js` — KV active-space store (stateless transcript — no `conv:<id>` keys).
 - `src/rotate.js` — createSpace → poll getSpaces → switch (no delete).
-- `src/worker.js` — auth, routing, SSE response, runTurn (build from client `messages` → stream → rotate-on-credit → done).
+- `src/worker.js` — auth, routing (`/health`, `/api/models`, `/api/chat`), per-request model validation, SSE response, runTurn (build from client `messages` → stream → rotate-on-credit → done).

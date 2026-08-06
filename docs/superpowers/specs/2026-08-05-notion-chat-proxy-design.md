@@ -9,8 +9,14 @@ Một serverless function `POST /api/chat` trên Cloudflare Worker, đóng vai t
 
 ## Phạm vi
 
-- Bao gồm: endpoint `/api/chat` (SSE), streaming, xoay workspace reactive khi hết credit. Transcript do web giữ gửi lại mỗi lượt — worker stateless cho transcript (chỉ 1 KV read `state:activeSpace`/lượt).
+- Bao gồm: endpoint `/api/chat` (SSE), endpoint `GET /api/models` (model picker — proxy `getAvailableModels`), chọn model per-request (`body.model`), streaming, xoay workspace reactive khi hết credit. Transcript do web giữ gửi lại mỗi lượt — worker stateless cho transcript (chỉ 1 KV read `state:activeSpace`/lượt).
 - Không bao gồm: UI chat (web của user tự lo — web tự giữ history để render + gửi lại), SDK integration (chỉ tham khảo pattern), continue/poll đa bước (Notion trả 1 call đầy đủ khi còn credit; rỗng = hết credit, không phải multi-step).
+
+### Model picker + chọn model per-request
+
+- `GET /api/models` (Bearer auth) → worker gọi `POST /api/v3/getAvailableModels` (`{spaceId}`, cần header `x-notion-active-user-header` + `x-notion-space-id`) → trả `{ models: [...] }` shape sạch cho picker: `id` (codename), `name`, `family`, `provider`, `displayGroup`, `disabled`, `disabledReason`, `supportedReasoningEfforts`, `defaultReasoningEffort`. Bỏ field nội bộ (beta flags, `modelCardAttributes`...).
+- Cache in-memory isolate-scope TTL ~1h (`src/models.js`) để `/api/chat` validate không thêm Notion/KV call khi warm.
+- `/api/chat` nhận `body.model` (optional, codename). Mặc định `NOTION_MODEL` (`fireworks-kimi-k3`). Khi khác default → validate against list cached: reject disabled/unknown bằng `400` TRƯỚC khi mở SSE stream. List unavailable (fetch fail) → **fail open** (cho qua, để Notion reject). Khi `model` == default → skip validate (path phổ thông không tốn Notion call).
 
 ## Nghiên cứu đã xác nhận (test bằng token thật)
 
@@ -61,9 +67,10 @@ Authorization: Bearer <API_KEY>
 Content-Type: application/json
 { "conversationId": "abc",
   "messages": [ {"role":"user","text":"hi"}, {"role":"ai","text":"hello"} ],
-  "message": "how are you" }
+  "message": "how are you",
+  "model": "fireworks-kimi-k3" }
 ```
-- `messages[]` = các lượt TRƯỚC (web tự giữ để render UI + gửi lại mỗi lượt). `message` = text user mới lượt này. Worker KHÔNG lưu/persist transcript.
+- `messages[]` = các lượt TRƯỚC (web tự giữ để render UI + gửi lại mỗi lượt). `message` = text user mới lượt này. Worker KHÔNG lưu/persist transcript. `model` (optional) = codename từ `GET /api/models` (mặc định `NOTION_MODEL`); khác default thì worker validate trước khi stream.
 - Lượt đầu tiên: `messages: []`, `message: "hi"`.
 Response `text/event-stream`:
 - `event: thinking` `data: <delta>` — reasoning (optional)
@@ -145,8 +152,9 @@ Bằng chứng (test token thật): space cũ `319d7f78...` trả `premium-featu
 
 ```
 src/
-  worker.js        // Worker entry: route /api/chat, auth, SSE, runTurn (stateless transcript)
-  notion.js        // HTTP client: callRunInference, ndjsonLines, getSpaces, createSpace
+  worker.js        // Worker entry: route /api/chat + /api/models, auth, SSE, runTurn (stateless transcript)
+  notion.js        // HTTP client: callRunInference, ndjsonLines, getSpaces, createSpace, getAvailableModels
+  models.js        // getAvailableModels transform + per-request model validation + in-memory cache
   transcript.js    // body builders: config/context/entries, buildInferenceBody, findNewSpace/findSpaceById
   store.js         // KV active-space store (KHÔNG lưu transcript — chỉ state:activeSpace)
   rotate.js        // workspace rotation: createSpace + poll getSpaces + switch (không xóa)

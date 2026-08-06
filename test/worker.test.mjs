@@ -5,6 +5,8 @@ import worker from "../src/worker.js";
 import helloNdjson from "./fixtures/runInference-hello.ndjson?raw";
 import unavailableNdjson from "./fixtures/runInference-unavailable.ndjson?raw";
 import getSpacesJson from "./fixtures/getSpaces.json";
+import getAvailableModelsJson from "./fixtures/getAvailableModels.json";
+import { _resetCache } from "../src/models.js";
 
 const ACTIVE = { spaceId: "S", spaceViewId: "SV", userId: "U", name: "Space" };
 
@@ -27,7 +29,7 @@ async function postChat(body, headers = {}) {
 // Options: firstUnavailable (1st call unavailable, rest hello),
 //          alwaysUnavailable (every call unavailable), inferenceStatus (return a
 //          non-2xx empty body for runInferenceTranscript to simulate auth/expiry).
-function notionMock({ firstUnavailable = false, alwaysUnavailable = false, inferenceStatus = 0 } = {}) {
+function notionMock({ firstUnavailable = false, alwaysUnavailable = false, inferenceStatus = 0, modelsStatus = 0 } = {}) {
   let inferenceCalls = 0;
   let lastBody = null;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
@@ -44,6 +46,10 @@ function notionMock({ firstUnavailable = false, alwaysUnavailable = false, infer
     }
     if (req.url.endsWith("/createSpace")) return new Response("{}", { headers: { "content-type": "application/json" } });
     if (req.url.endsWith("/getSpaces")) return new Response(JSON.stringify(getSpacesJson), { headers: { "content-type": "application/json" } });
+    if (req.url.endsWith("/getAvailableModels")) {
+      if (modelsStatus > 0) return new Response("err", { status: modelsStatus });
+      return new Response(JSON.stringify(getAvailableModelsJson), { headers: { "content-type": "application/json" } });
+    }
     throw new Error("unexpected " + req.url);
   });
   return { inferenceCalls: () => inferenceCalls, lastBody: () => lastBody };
@@ -51,6 +57,7 @@ function notionMock({ firstUnavailable = false, alwaysUnavailable = false, infer
 
 afterEach(() => vi.restoreAllMocks());
 beforeEach(async () => {
+  _resetCache();
   await env.STORE.delete("state:activeSpace");
   await env.STORE.put("state:activeSpace", JSON.stringify(ACTIVE));
 });
@@ -175,5 +182,76 @@ describe("POST /api/chat streaming", () => {
     expect(text).toContain("event: done");
     const active = JSON.parse(await env.STORE.get("state:activeSpace"));
     expect(active.spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
+  });
+});
+
+describe("GET /api/models", () => {
+  it("returns the transformed model list (200)", async () => {
+    notionMock({});
+    const res = await worker.fetch(
+      new Request("https://worker.test/api/models", { headers: { authorization: "Bearer k" } }),
+      env, createExecutionContext(),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    const data = await res.json();
+    const ids = data.models.map((m) => m.id);
+    expect(ids).toContain("fireworks-kimi-k3");
+    expect(ids).toContain("oatmeal-cookie");
+    const fable = data.models.find((m) => m.id === "acai-budino-high");
+    expect(fable.disabled).toBe(true);
+    expect(fable.disabledReason).toBe("business_or_enterprise_plan_required");
+  });
+  it("rejects without auth (401)", async () => {
+    notionMock({});
+    const res = await worker.fetch(new Request("https://worker.test/api/models"), env, createExecutionContext());
+    expect(res.status).toBe(401);
+  });
+  it("returns 502 when Notion getAvailableModels fails", async () => {
+    notionMock({ modelsStatus: 500 });
+    const res = await worker.fetch(
+      new Request("https://worker.test/api/models", { headers: { authorization: "Bearer k" } }),
+      env, createExecutionContext(),
+    );
+    expect(res.status).toBe(502);
+  });
+});
+
+describe("POST /api/chat per-request model", () => {
+  it("uses the requested model in the Notion body when valid + non-default", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChat({ conversationId: "cm1", messages: [], message: "hi", model: "oatmeal-cookie" });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(text).toContain("event: done");
+    expect(m.lastBody().transcript[0].value.model).toBe("oatmeal-cookie");
+  });
+  it("rejects a disabled model with 400 (before opening the stream)", async () => {
+    notionMock({});
+    const { res } = await postChat({ messages: [], message: "hi", model: "acai-budino-high" });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("disabled");
+  });
+  it("rejects an unknown model with 400", async () => {
+    notionMock({});
+    const { res } = await postChat({ messages: [], message: "hi", model: "nope-not-a-model" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("unknown");
+  });
+  it("defaults to NOTION_MODEL when no model field is sent", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChat({ messages: [], message: "hi" });
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(m.lastBody().transcript[0].value.model).toBe("fireworks-kimi-k3");
+  });
+  it("skips validation when the requested model equals the configured default", async () => {
+    const m = notionMock({});
+    const { res, ctx } = await postChat({ messages: [], message: "hi", model: "fireworks-kimi-k3" });
+    await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(m.lastBody().transcript[0].value.model).toBe("fireworks-kimi-k3");
   });
 });

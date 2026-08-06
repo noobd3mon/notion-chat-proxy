@@ -56,6 +56,20 @@ export async function getSpaces({ token, userId, spaceId, clientVersion }) {
   return res.json();
 }
 
+// POST getAvailableModels; return parsed JSON. Per the capture from
+// app.notion.com's chat model picker: needs the active user + space headers and
+// a { spaceId } body. Returns the account's model picker config (enabled models,
+// disabled reasons, supported reasoning efforts).
+export async function getAvailableModels({ token, userId, spaceId, clientVersion }) {
+  const res = await fetch(`${NOTION_BASE}/getAvailableModels`, {
+    method: "POST",
+    headers: notionHeaders({ token, userId, spaceId, clientVersion, accept: "application/json" }),
+    body: JSON.stringify({ spaceId }),
+  });
+  if (!res.ok) throw new Error(`getAvailableModels failed: ${res.status}`);
+  return res.json();
+}
+
 // POST createSpace with 429 exponential-backoff retry. Default maxRetries=3
 // caps total sleep at 7s (1+2+4) so rotation stays well under the Workers
 // wall-clock limit even when preceded by an inference call.
