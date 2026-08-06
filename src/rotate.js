@@ -1,21 +1,54 @@
-// Workspace rotation: createSpace -> take the new space id FROM THE createSpace
-// RESPONSE -> persist -> switch. No delete (delete is client-side only in Notion;
-// no server API).
+// Workspace rotation. On credit exhaustion we switch to another workspace that
+// still has credit, so chat keeps working.
 //
-// IMPORTANT: spaces created via the internal `createSpace` API (planType:"team")
-// do NOT appear in `getSpaces` for the user — so the old "poll getSpaces to find the
-// new space" approach does not work in practice. The new space's id MUST come from
-// the createSpace response. Notion uses camelCase, so we prefer `spaceId` /
-// `spaceViewId`; we also scan the response for any uuid that isn't the old id as a
-// fallback in case the field is named differently. If the response yields nothing,
-// we make one last-resort getSpaces attempt (some accounts may eventually list it)
-// before giving up.
+// Two sources of a "next" workspace, tried in order:
+//   1. REUSE a previously-created workspace we already know about (state:knownSpaces).
+//      Notion resets a workspace's free AI credit over time, so an OLD workspace
+//      (created hours/days ago) may have recovered credit. Reusing one avoids
+//      createSpace entirely — which matters because Notion HARD rate-limits
+//      createSpace (UserRateLimitResponse / 429) after only a few calls. We persist
+//      every workspace we create so future rotations can cycle back to it. (These
+//      API-created workspaces do NOT appear in getSpaces, so we must remember them.)
+//   2. CREATE a new workspace (createSpace). This is the rate-limited op, used only
+//      as a last resort when no known workspace is left to try. The new id comes
+//      straight from the createSpace response (getSpaces can't see API-created
+//      workspaces). On 429 it throws a clear error — the rate limit is Notion-side.
+//
+// runTurn drives this: it calls rotateWorkspace each time the current workspace
+// returns "unavailable", passing a `tried` set so we don't revisit an exhausted
+// workspace within the same turn. After cycling known workspaces it falls through
+// to createSpace.
 import { createSpace, getSpaces } from "./notion.js";
 import { buildCreateSpaceBody, findNewSpace, nid } from "./transcript.js";
-import { setActiveSpace } from "./store.js";
+import { setActiveSpace, getKnownSpaces, addKnownSpace } from "./store.js";
 
-export async function rotateWorkspace({ env, kv, currentSpace }) {
+// Sentinel stored in the `tried` set once createSpace has been attempted this turn.
+// rotateWorkspace checks it so we call the rate-limited createSpace at most ONCE per
+// turn — if every known workspace is exhausted, we error instead of hammering it.
+const CREATE_MARK = "__createSpace__";
+
+export async function rotateWorkspace({ env, kv, currentSpace, tried = new Set() }) {
   const clientVersion = env.NOTION_CLIENT_VERSION;
+
+  // 1. Try to REUSE a known workspace we haven't already tried this turn. Prefer
+  //    the OLDEST (most likely to have recovered credit since we last exhausted it).
+  const known = await getKnownSpaces(kv);
+  const candidate = known
+    .filter((s) => s.spaceId && s.spaceId !== currentSpace?.spaceId && !tried.has(s.spaceId))
+    .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))[0];
+  if (candidate) {
+    const rec = { spaceId: candidate.spaceId, spaceViewId: candidate.spaceViewId ?? null, name: candidate.name, userId: candidate.userId ?? currentSpace?.userId };
+    await setActiveSpace(kv, rec);
+    return rec;
+  }
+
+  // 2. No known workspace to reuse -> create a new one (the rate-limited op). Cap at
+  //    ONE createSpace per turn: if we already attempted it this turn (every known
+  //    workspace was exhausted), error instead of hammering the rate-limited endpoint.
+  if (tried.has(CREATE_MARK)) {
+    throw new Error("rotation failed: all known workspaces exhausted this turn and createSpace was already attempted");
+  }
+  tried.add(CREATE_MARK);
   const name = rotationName();
   const body = buildCreateSpaceBody({ name, deviceId: nid() });
   // createSpace uses the OLD space as x-notion-space-id (matches the real capture).
@@ -23,18 +56,16 @@ export async function rotateWorkspace({ env, kv, currentSpace }) {
     token: env.NOTION_TOKEN_V2, userId: currentSpace.userId,
     spaceId: currentSpace.spaceId, clientVersion, body,
   });
-
-  let rec = spaceFromCreateResponse(resp, currentSpace, name);
+  const rec = spaceFromCreateResponse(resp, currentSpace, name);
   if (!rec.spaceId) {
-    // Last resort: the createSpace response had no recognizable space id. Try one
-    // getSpaces in case this account does list the new space (it usually does NOT).
-    const gs = await getSpaces({
-      token: env.NOTION_TOKEN_V2, userId: currentSpace.userId,
-      spaceId: currentSpace.spaceId, clientVersion,
-    });
-    rec = findNewSpace(gs, currentSpace.spaceId);
+    // Last resort: the createSpace response had no recognizable id. Try getSpaces in
+    // case this account does list the new space (it usually does NOT).
+    const gs = await getSpaces({ token: env.NOTION_TOKEN_V2, userId: currentSpace.userId, spaceId: currentSpace.spaceId, clientVersion });
+    const found = findNewSpace(gs, currentSpace.spaceId);
+    if (found?.spaceId) Object.assign(rec, found);
   }
-  if (!rec || !rec.spaceId) throw new Error("rotation failed: createSpace returned no spaceId and getSpaces did not list a new space");
+  if (!rec.spaceId) throw new Error("rotation failed: createSpace returned no spaceId and getSpaces did not list a new space");
+  await addKnownSpace(kv, rec);
   await setActiveSpace(kv, rec);
   return rec;
 }

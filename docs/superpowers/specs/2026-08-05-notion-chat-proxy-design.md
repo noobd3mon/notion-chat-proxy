@@ -209,3 +209,20 @@ test/              // vitest: patch, sse, transcript, notion, store, rotate, wor
 **Persist ra file (`server.js`):** KV shim giờ **file-backed** — `state:activeSpace` ghi ra JSON file (`STATE_FILE`, default `./data/active-space.json`). Vì space tạo bằng API không có trong getSpaces, restart phải đọc lại từ file (không recover được qua getSpaces). Trên Railway: mount **Volume** tại `/data`, set `STATE_FILE=/data/active-space.json` để sống qua restart/redeploy. Không volume → mất space đã rotate, fallback về space gốc (có thể hết credit → rotate lại). `data/` thêm vào `.gitignore` + `.dockerignore`.
 
 **Lưu verify:** shape response `createSpace` chưa live-verify được — token đang bị **429 `UserRateLimitResponse`** khi createSpace (tạo nhiều space do rotation). Extractor là defensive theo convention camelCase (`spaceId`/`spaceViewId`). Khi rate-limit clear, chạy `node _research/probe-createspace.mjs` (gitignored) để capture response thật + siết lại field nếu cần. Test mock `createSpace` trả `{spaceId,spaceViewId,name}` → 105/105 green (rotate 2→7).
+
+## Addendum: Rotation resilient — tái dùng space cũ + cap createSpace 1 lần/turn
+
+**Vấn đề (user confirm):** 429 `UserRateLimitResponse` khi `createSpace` là **thật** — Notion rate-limit `createSpace` rất gắt sau vài lần tạo. Rotation cũ mỗi lần hết credit lại `createSpace` → nhanh 429 → rotation gãy, user bị `event: error`.
+
+**Fix thực chất — tái dùng space cũ trước khi tạo mới:** Notion reset free AI credit của một space theo thời gian, nên space đã tạo cách đây vài giờ/ngày **có thể đã phục hồi credit**. Giờ rotation:
+1. **REUSE** space đã tạo trước đây (lưu trong `state:knownSpaces`) mà chưa thử turn này — ưu tiên **cũ nhất** (khả năng phục hồi cao nhất). Miễn phí (không call Notion).
+2. **Cycle** qua các space known (`MAX_ROTATION = 5` attempt/turn), skip space đã thử (set `tried` truyền qua các lần rotate), đến khi space nào trả answer thật.
+3. Chỉ khi **hết space known** mới fall through `createSpace` — và **cap 1 lần/turn** (sentinel `"__createSpace__"` trong `tried`): nếu mọi space known đều hết credit, error sạch thay vì đập rate-limited endpoint. Space mới tạo được append vào `state:knownSpaces` để tái dùng lần sau.
+
+**`src/store.js`:** thêm `KNOWN = "state:knownSpaces"`, `getKnownSpaces(kv)` (trả array insertion-order), `addKnownSpace(kv, record)` (dedupe by spaceId, stamp `createdAt`). Vì space tạo bằng API không có trong getSpaces, phải tự nhớ id.
+
+**`src/rotate.js`:** `rotateWorkspace({env,kv,currentSpace,tried=new Set()})` — (1) lọc known space `!== currentSpace` và không trong `tried`, sort theo `createdAt` asc, lấy oldest → `setActiveSpace` + return (no fetch). (2) không có candidate → guard `tried.has(CREATE_MARK)` → throw "all known workspaces exhausted ... createSpace was already attempted"; else `tried.add(CREATE_MARK)` rồi `createSpace` (rate-limited op, dùng old space làm `x-notion-space-id`) → `spaceFromCreateResponse` (camelCase + uuid-scan fallback) → fallback `getSpaces` nếu response không có id → `addKnownSpace` + `setActiveSpace`.
+
+**`src/worker.js`:** `MAX_ROTATION = 5` (trước đây 1); `runTurn` giữ `const tried = new Set()`, mỗi iteration `tried.add(activeSpace.spaceId)` rồi truyền `tried` vào `rotateWorkspace`. Giúp cycle nhiều space known trong 1 turn + chặn createSpace >1 lần.
+
+**Tests:** `test/store.test.mjs` (+5 knownSpaces = 8), `test/rotate.test.mjs` (+1 createSpace-cap = 11; reuse-oldest/skip-tried/persist + camelCase/uuid-scan/getSpaces-fallback/throw), `test/worker.test.mjs` (+2 cycling E2E = 33: reuse 1 known space không call createSpace; cycle S→K1(exhausted)→K2(hello) 3 inference). **116/116 tests green.** Lưu: shape `createSpace` response vẫn chưa live-verify (429) — khi clear, chạy `probe-createspace.mjs` để siết `spaceFromCreateResponse` field nếu cần.

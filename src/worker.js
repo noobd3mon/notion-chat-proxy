@@ -5,7 +5,10 @@ import { getActiveSpace, setActiveSpace } from "./store.js";
 import { rotateWorkspace } from "./rotate.js";
 import { ensureModelsList, validateModel } from "./models.js";
 
-const MAX_ROTATION = 1;
+// Allow several rotation attempts per turn so the worker can cycle through known
+// (previously-created) workspaces whose credit may have recovered, only falling
+// through to createSpace (which Notion rate-limits) when none are left to try.
+const MAX_ROTATION = 5;
 
 export default {
   async fetch(req, env, ctx) {
@@ -149,7 +152,10 @@ async function streamChat({ env, ctx, conversationId, messages, message, model, 
 }
 
 async function runTurn({ env, kv, activeSpace, messages, message, model, contextPageId, attachments, threadId, enableWebResearch, internetAccess, write }) {
+  // Workspaces already tried this turn (so rotation never revisits an exhausted one).
+  const tried = new Set();
   for (let attempt = 0; attempt <= MAX_ROTATION; attempt++) {
+    tried.add(activeSpace.spaceId);
     const body = buildInferenceBody({
       spaceId: activeSpace.spaceId, userId: activeSpace.userId, spaceViewId: activeSpace.spaceViewId,
       spaceName: activeSpace.name, userName: env.NOTION_USER_NAME, userEmail: env.NOTION_USER_EMAIL,
@@ -173,12 +179,12 @@ async function runTurn({ env, kv, activeSpace, messages, message, model, context
     }
     if (ps.isUnavailable && attempt < MAX_ROTATION) {
       try {
-        activeSpace = await rotateWorkspace({ env, kv, currentSpace: activeSpace });
+        activeSpace = await rotateWorkspace({ env, kv, currentSpace: activeSpace, tried });
       } catch (e) {
         await write("error", { message: `rotation failed: ${e.message}` });
         return;
       }
-      continue; // retry the SAME message on the new space
+      continue; // retry the SAME message on the next workspace (reused or new)
     }
     if (ps.isUnavailable) {
       await write("error", { message: "Notion AI credit exhausted on all workspaces" });

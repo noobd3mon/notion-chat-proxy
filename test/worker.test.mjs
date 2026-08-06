@@ -101,6 +101,7 @@ afterEach(() => vi.restoreAllMocks());
 beforeEach(async () => {
   _resetCache();
   await env.STORE.delete("state:activeSpace");
+  await env.STORE.delete("state:knownSpaces");
   await env.STORE.put("state:activeSpace", JSON.stringify(ACTIVE));
 });
 
@@ -192,6 +193,49 @@ describe("POST /api/chat streaming", () => {
     expect(m.lastBody().spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
     const active = JSON.parse(await env.STORE.get("state:activeSpace"));
     expect(active.spaceId).toBe("0a06e656-4f5e-8172-a2f9-0003c6a35c94");
+  });
+
+  it("reuses a previously-created (known) workspace instead of calling createSpace", async () => {
+    await env.STORE.put("state:knownSpaces", JSON.stringify([
+      { spaceId: "K1", spaceViewId: "KSV1", name: "k1", userId: "U", createdAt: 100 },
+    ]));
+    const m = notionMock({ firstUnavailable: true }); // ACTIVE(S) unavailable, next call hello
+    const { res, ctx } = await postChat({ conversationId: "cyc-reuse", messages: [], message: "hello" });
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(m.inferenceCalls()).toBe(2); // 1st (S) unavailable -> reuse K1 -> 2nd (K1) hello
+    expect(m.lastBody().spaceId).toBe("K1"); // retried on the KNOWN space, no createSpace
+    expect(text).toContain("event: done");
+    expect(text).toContain("Hello, Ky!");
+    expect(JSON.parse(await env.STORE.get("state:activeSpace")).spaceId).toBe("K1");
+  });
+
+  it("cycles through multiple known workspaces until one has credit (no createSpace)", async () => {
+    await env.STORE.put("state:knownSpaces", JSON.stringify([
+      { spaceId: "K1", spaceViewId: null, name: "k1", userId: "U", createdAt: 100 },
+      { spaceId: "K2", spaceViewId: null, name: "k2", userId: "U", createdAt: 200 },
+    ]));
+    // S and K1 are exhausted; K2 has credit. Key the mock on spaceId in the body.
+    const exhausted = new Set(["S", "K1"]);
+    let calls = 0, lastBody = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const req = new Request(input, init);
+      if (req.url.endsWith("/runInferenceTranscript")) {
+        calls++;
+        lastBody = JSON.parse(init.body);
+        return new Response(exhausted.has(lastBody.spaceId) ? unavailableNdjson : helloNdjson, { headers: { "content-type": "application/x-ndjson" } });
+      }
+      if (req.url.endsWith("/getAvailableModels")) return new Response(JSON.stringify(getAvailableModelsJson), { headers: { "content-type": "application/json" } });
+      throw new Error("unexpected (rotation should reuse known spaces, not call Notion): " + req.url);
+    });
+    const { res, ctx } = await postChat({ conversationId: "cyc-multi", messages: [], message: "hello" });
+    const text = await res.text();
+    await waitOnExecutionContext(ctx);
+    expect(calls).toBe(3); // S -> K1 (exhausted) -> K2 (hello)
+    expect(lastBody.spaceId).toBe("K2");
+    expect(text).toContain("event: done");
+    expect(text).toContain("Hello, Ky!");
+    expect(JSON.parse(await env.STORE.get("state:activeSpace")).spaceId).toBe("K2");
   });
 
   it("returns event: error when credit is exhausted on every workspace", async () => {

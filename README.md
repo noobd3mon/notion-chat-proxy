@@ -64,9 +64,13 @@ docker run -p 8080:8080 -e API_KEY=k -e NOTION_TOKEN_V2=<token> \
   -e NOTION_USER_NAME=Ky -e NOTION_USER_EMAIL=you@example.com <your-dockerhub-user>/notion-chat-proxy:latest
 ```
 
-> The active workspace id is persisted to `STATE_FILE` (default `./data/active-space.json`, a JSON map). On the first request after an empty start the worker bootstraps from `getSpaces`; afterwards the file holds the active (possibly rotation-created) space. **Mount a volume** (Railway Volume at `/data`, `STATE_FILE=/data/active-space.json`) to survive restarts/redeploys — otherwise a redeploy loses the rotated-to space and the worker falls back to your original space (which may be credit-exhausted, triggering a fresh rotation). For multi-replica you'd want a shared store (out of scope here).
+> The active workspace id AND the list of every workspace ever created by the rotation flow are persisted to `STATE_FILE` (default `./data/active-space.json`, a JSON map keyed by `state:activeSpace` and `state:knownSpaces`). On the first request after an empty start the worker bootstraps from `getSpaces`; afterwards the file holds the active (possibly rotation-created) space plus the history of created spaces. **Mount a volume** (Railway Volume at `/data`, `STATE_FILE=/data/active-space.json`) to survive restarts/redeploys — otherwise a redeploy loses the rotated-to space and the worker falls back to your original space (which may be credit-exhausted, triggering a fresh rotation). For multi-replica you'd want a shared store (out of scope here).
 
-> **Rotation note:** spaces created by the `createSpace` API (planType `"team"`) do **not** appear in `getSpaces` for your user. So `rotateWorkspace` takes the new space id straight from the `createSpace` response (Notion camelCase `spaceId` / `spaceViewId`, with a uuid-scan fallback), and only falls back to `getSpaces` if the response carries no recognizable id. The active space is then persisted to the file above.
+> **Rotation note (known-space cycling + createSpace cap):** spaces created by the `createSpace` API (planType `"team"`) do **not** appear in `getSpaces` for your user, so we must remember their ids ourselves (`state:knownSpaces`). Notion also **hard rate-limits `createSpace`** (`UserRateLimitResponse` / 429) after only a few calls. So rotation does NOT always create a new space:
+> - On credit exhaustion the worker first **reuses a previously-created (known) workspace** whose free AI credit may have recovered over time — preferring the oldest (most likely recovered). This is free (no Notion call).
+> - It cycles through known workspaces (`MAX_ROTATION = 5` attempts per turn), skipping any already tried this turn, until one returns a real answer.
+> - Only when no known workspace is left does it fall through to `createSpace` — and it caps that at **one call per turn** (a sentinel in the `tried` set), so a fully-exhausted account errors cleanly instead of hammering the rate-limited endpoint.
+> - The new space id comes straight from the `createSpace` response (Notion camelCase `spaceId` / `spaceViewId`, with a uuid-scan fallback); `getSpaces` is only a last resort if the response carries no recognizable id. The created space is appended to `state:knownSpaces` for future reuse.
 
 > Cloudflare Workers deploy is still available via `npm run deploy` (uses `wrangler.toml` + real Cloudflare KV, which is already persistent — no STATE_FILE needed there). Both targets run the same `src/*` code.
 
@@ -211,6 +215,6 @@ Use `id` as the `model` field in `POST /api/chat`. The list is cached in-memory 
 - `src/transcript.js` — builds Notion request bodies (config/context/entries, attachment entry, createSpace, space discovery).
 - `src/notion.js` — HTTP client + line streamer (runInferenceTranscript, getSpaces, createSpace, getAvailableModels, file upload flow: getUploadFileUrl → S3 → enqueueTask → getTasks).
 - `src/models.js` — getAvailableModels transform + per-request model validation + in-memory cache.
-- `src/store.js` — KV active-space store (stateless transcript — no `conv:<id>` keys).
-- `src/rotate.js` — createSpace → poll getSpaces → switch (no delete).
+- `src/store.js` — KV store for `state:activeSpace` (current workspace) and `state:knownSpaces` (every workspace the rotation flow has ever created, for reuse). The transcript itself is stateless (no `conv:<id>` keys).
+- `src/rotate.js` — workspace rotation: reuse oldest known (recovered-credit) workspace first, else createSpace (capped at one call per turn) → switch (no delete). Persists created spaces to `state:knownSpaces` since they don't appear in `getSpaces`.
 - `src/worker.js` — auth, routing (`/health`, `/api/models`, `/api/chat`), JSON + multipart body parsing, per-request model validation, file upload orchestration, web-search enablement, SSE response, runTurn (build from client `messages` + `attachments` → stream → rotate-on-credit → done).
