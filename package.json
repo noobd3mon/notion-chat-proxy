@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/worker.js",
   "scripts": {
+    "start": "node server.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "wrangler dev",

@@ -25,6 +25,47 @@ npm run deploy    # production: wrangler deploy
 
 Set production secrets with `npx wrangler secret put NOTION_TOKEN_V2` (and `API_KEY`, `NOTION_USER_NAME`, `NOTION_USER_EMAIL`).
 
+## Self-host on Railway / Docker (no Cloudflare Workers)
+
+`server.js` is a tiny Node adaptor that runs the **same** `src/worker.js` handler as a plain HTTP server, providing an in-memory KV (`env.STORE`) + `ctx.waitUntil` + all config from `process.env`. Pure Web APIs the worker uses are globals in Node 18+, so `src/*` runs unchanged. The `Dockerfile` packages it as an image.
+
+### Build & push the image (on a machine with Docker)
+
+```bash
+docker build -t <your-dockerhub-user>/notion-chat-proxy:latest .
+docker login
+docker push <your-dockerhub-user>/notion-chat-proxy:latest
+```
+
+### Deploy on Railway
+
+1. New project → Deploy from Docker image → `<your-dockerhub-user>/notion-chat-proxy:latest`.
+2. In **Variables**, set (all required except where noted):
+   - `API_KEY` — your worker auth key (clients send `Authorization: Bearer <API_KEY>`).
+   - `NOTION_TOKEN_V2` — your `token_v2` cookie value (the secret).
+   - `NOTION_USER_NAME`, `NOTION_USER_EMAIL` — your Notion display name + email.
+   - `NOTION_TIMEZONE` (default `Asia/Saigon`).
+   - `NOTION_MODEL` (default `fireworks-kimi-k3`), `REASONING_EFFORT` (default `max`).
+   - `NOTION_CLIENT_VERSION` (default `23.13.20260805.2047`).
+   - `NOTION_SPACE_ID` (optional — initial space; if omitted, the worker picks the newest from `getSpaces`).
+3. Railway gives `PORT` automatically; the server listens on it. Expose the port (Railley does this for web services).
+4. Health check: `GET https://<your-app>.up.railway.app/health` → `ok`.
+
+### Run locally with Node / Docker
+
+```bash
+# Node (no Docker):
+PORT=8080 API_KEY=k NOTION_TOKEN_V2=<token> NOTION_USER_NAME=Ky NOTION_USER_EMAIL=you@example.com node server.js
+
+# Docker:
+docker run -p 8080:8080 -e API_KEY=k -e NOTION_TOKEN_V2=<token> \
+  -e NOTION_USER_NAME=Ky -e NOTION_USER_EMAIL=you@example.com <your-dockerhub-user>/notion-chat-proxy:latest
+```
+
+> The in-memory KV resets on restart. On the first request after a restart the worker re-derives the active space from `getSpaces`, so this is fine for a single replica. For multi-replica you'd want a shared store (out of scope here).
+
+> Cloudflare Workers deploy is still available via `npm run deploy` (uses `wrangler.toml` + real Cloudflare KV). Both targets run the same `src/*` code.
+
 ## Consume the endpoint
 
 ```

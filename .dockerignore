@@ -1,0 +1,15 @@
+# Keep the image small + keep secrets out of the build context.
+node_modules
+.git
+.wrangler
+.dev.vars
+_research
+.superpowers
+test
+docs
+*.md
+.gitignore
+.dev.vars.example
+vitest.config.mjs
+wrangler.toml
+wrangler.test.toml
