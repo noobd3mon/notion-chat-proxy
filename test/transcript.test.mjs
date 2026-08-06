@@ -14,12 +14,17 @@ describe("nid", () => {
 });
 
 describe("buildConfig", () => {
-  it("overrides model + reasoningEffort, keeps captured defaults", () => {
+  it("overrides model + reasoningEffort, keeps captured defaults (ask mode)", () => {
     const c = buildConfig({ model: "other", reasoningEffort: "low" });
     expect(c.model).toBe("other");
     expect(c.reasoningEffort).toBe("low");
     expect(c.type).toBe("workflow");
-    expect(c.searchScopes).toEqual([{ type: "everything" }]);
+    // ask mode: no workspace/help-center access, read-only, no connectors
+    expect(c.searchScopes).toEqual([{ type: "ai-knowledge" }]);
+    expect(c.useReadOnlyMode).toBe(true);
+    expect(c.availableConnectors).toEqual([]);
+    expect(c.useWebSearch).toBe(true);
+    expect(c.enableComputer).toBe(false);
   });
 });
 

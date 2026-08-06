@@ -93,7 +93,7 @@ Response `text/event-stream`:
   "debugOverrides": { "emitAgentSearchExtractedResults": true, "cachedInferences":{}, "annotationInferences":{}, "emitInferences":false }
 }
 ```
-Config dùng model `fireworks-kimi-k3` (configurable), `reasoningEffort:"max"`.
+Config dùng model `fireworks-kimi-k3` (configurable), `reasoningEffort:"max"`. Mặc định là **ask mode** (capture từ `app.notion.com/ai`): `searchScopes:[{type:"ai-knowledge"}]` (KHÔNG đọc nội dung workspace/space, KHÔNG search Notion help center — chỉ kiến thức model + web search), `useReadOnlyMode:true` (read-only, không edit/exec), `availableConnectors:[]` (không connector/tool), `useWebSearch:true`, `enableComputer:false`. AI "just answer" — không truy cập space, không help center, không chạy tool/computer; web search vẫn dùng được.
 
 ### Credit exhaustion → rotation trigger
 

@@ -9,14 +9,19 @@ export function nid() {
   return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
 }
 
-// Verbatim config object captured from a real working runInferenceTranscript call.
-// Do not trim flags — Notion may validate the shape.
+// Verbatim config object captured from Notion's "ask" mode (app.notion.com/ai):
+// the AI answers from its own parametric knowledge + web search ONLY — it does
+// NOT read workspace/space content, NOT search the Notion help center, and runs
+// read-only (no page edits, no tool/computer execution). The three flags that
+// make this "ask" mode vs the full_page_chat capture: searchScopes is
+// "ai-knowledge" (not "everything"), useReadOnlyMode is true, availableConnectors
+// is []. Do not trim flags — Notion may validate the shape.
 export const DEFAULT_CONFIG = {
   type: "workflow", model: "fireworks-kimi-k3", isHipaa: false, isMobile: false,
-  writerMode: false, searchScopes: [{ type: "everything" }], useWebSearch: true,
+  writerMode: false, searchScopes: [{ type: "ai-knowledge" }], useWebSearch: true,
   isCustomAgent: false, manageWorkers: false, modelFromUser: true, enableComputer: false,
   internetAccess: false, enableQueryMail: false, reasoningEffort: "max",
-  useReadOnlyMode: false, enableAgentDiffs: true, enableScriptAgent: true,
+  useReadOnlyMode: true, availableConnectors: [], enableAgentDiffs: true, enableScriptAgent: true,
   enableWebResearch: false, isOnboardingAgent: false, enableCustomAgents: true,
   enableAgentSkillsV2: false, enableMarkdownVNext: false, enableQueryCalendar: false,
   isCustomAgentCreate: false, useCustomAgentDraft: false, enableAgentAskSurvey: true,
